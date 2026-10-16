@@ -23,7 +23,9 @@ from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect
 from app.services.video_providers import client, http_util, polling
 from app.services.video_providers.errors import (
+    VideoProviderDownloadError,
     VideoProviderError,
+    VideoProviderUnconfirmedTaskError,
 )
 from app.services.video_providers.spec import VideoProviderSpec
 
@@ -48,13 +50,19 @@ SUPPORTED_RESOLUTIONS = frozenset({"768P", "2K"})
 
 class MetasoMiniMaxError(VideoProviderError):
     """秘塔 MiniMax 的确定性配置、请求或响应错误。"""
+    # 供任务层从异常反查 provider spec。
+    provider_id = "metaso_minimax"
 
 
-class MetasoMiniMaxUnconfirmedTaskError(MetasoMiniMaxError):
+class MetasoMiniMaxUnconfirmedTaskError(
+    MetasoMiniMaxError, VideoProviderUnconfirmedTaskError
+):
     """远端可能已创建付费任务，但本机无法确认其最终状态。"""
 
 
-class MetasoMiniMaxDownloadError(MetasoMiniMaxError):
+class MetasoMiniMaxDownloadError(
+    MetasoMiniMaxError, VideoProviderDownloadError
+):
     """远端付费任务已成功，但成片未能下载到本机。"""
 
 
@@ -69,7 +77,7 @@ SPEC = VideoProviderSpec(
     supports_native_audio=False,
     measure_downloaded_duration=False,
     remote_task_id_attr="task_id",
-    error_details_key="metaso_minimax_task_id",
+    missing_credentials_message="Metaso MiniMax requires an API key",
 )
 
 

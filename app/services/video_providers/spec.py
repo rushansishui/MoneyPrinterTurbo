@@ -68,6 +68,10 @@ class VideoProviderSpec:
     # 远端任务 ID 在异常对象上的属性名与写入失败详情时的键名。
     remote_task_id_attr: str = "task_id"
     error_details_key: str = ""
+    # 缺少凭据时的 preflight 提示文案。为空表示该源不参与 preflight 的凭据
+    # 检查（例如 WaveSpeed 历史上没有这道预检，保持原行为不变）。文案逐字保留
+    # 原有措辞，因为既有测试与用户排障信息都依赖它。
+    missing_credentials_message: str = ""
     # 模块级「异常类名后缀 → 语义」映射，供注册表做统一异常归类。
     error_class_names: tuple[str, ...] = field(default_factory=tuple)
 

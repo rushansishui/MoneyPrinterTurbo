@@ -10,6 +10,7 @@ import time
 import uuid
 import warnings
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Callable, List
 from urllib.parse import quote_plus, urlencode, urlsplit, urlunsplit
 
@@ -29,6 +30,10 @@ from app.services import (
     task_artifacts,
     video,
     volcengine_seedance,
+)
+from app.services.video_providers.errors import (
+    VideoProviderError,
+    VideoProviderUnconfirmedTaskError,
 )
 from app.utils import logging_utils, utils
 
@@ -1850,12 +1855,17 @@ def download_videos(
     elif material_directory and not os.path.isdir(material_directory):
         material_directory = ""
 
-    if source == "wavespeed":
-        # AI 生成按条计费，不能沿用库存源"先为全部关键词取回候选、再挑选"
-        # 的流程，否则会为用不到的片段付费。生成源改为逐段按需生成，凑够
-        # 所需时长立即停止；也不参与 24 小时搜索缓存——产物 URL 是会过期
-        # 的签名地址，且复用缓存会让不同任务反复得到同一段生成视频。
-        return _download_videos_wavespeed_on_demand(
+    # 付费 AI 生成源按条计费，不能沿用库存源"先为全部关键词取回候选、再挑选"
+    # 的流程，否则会为用不到的片段付费。它们统一走逐段按需生成，凑够所需时长
+    # 立即停止；也不参与 24 小时搜索缓存——产物 URL 是会过期的签名地址，且复用
+    # 缓存会让不同任务反复得到同一段生成视频。
+    #
+    # 分派由注册表查找完成：新增一个生成源只需在 _GENERATED_VIDEO_PROVIDERS
+    # 登记，这里不必再添加分支。
+    generated_provider = _GENERATED_VIDEO_PROVIDERS.get(source)
+    if generated_provider is not None:
+        return _download_generated_videos_on_demand(
+            provider=generated_provider,
             task_id=task_id,
             search_terms=search_terms,
             video_aspect=video_aspect,
@@ -1863,52 +1873,7 @@ def download_videos(
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
         )
-    if source == "volcengine_seedance":
-        # 与 WaveSpeed 相同，方舟官方接口会创建异步付费任务。必须按需逐段
-        # 生成，只购买当前配音时长真正需要的素材。
-        return _download_videos_seedance_on_demand(
-            task_id=task_id,
-            search_terms=search_terms,
-            video_aspect=video_aspect,
-            audio_duration=audio_duration,
-            max_clip_duration=max_clip_duration,
-            material_directory=material_directory,
-        )
-    if source == "ofox":
-        # 与 WaveSpeed/方舟相同的按需付费语义：OFox 网关的 /v1/videos 会创建
-        # 异步付费任务，必须逐段生成、凑够所需时长立即停止；产物地址是会过
-        # 期的临时直链，也不参与 24 小时搜索缓存。
-        return _download_videos_ofox_on_demand(
-            task_id=task_id,
-            search_terms=search_terms,
-            video_aspect=video_aspect,
-            audio_duration=audio_duration,
-            max_clip_duration=max_clip_duration,
-            material_directory=material_directory,
-        )
-    if source == "muapi":
-        # MuAPI 的模型端点会创建异步付费任务。逐段提交并在覆盖配音时长后
-        # 停止，避免把未使用的脚本关键词也发送到远端。
-        return _download_videos_muapi_on_demand(
-            task_id=task_id,
-            search_terms=search_terms,
-            video_aspect=video_aspect,
-            audio_duration=audio_duration,
-            max_clip_duration=max_clip_duration,
-            material_directory=material_directory,
-        )
-    if source == "metaso_minimax":
-        # 秘塔 MiniMax 同样按远端异步任务计费。它与火山方舟的请求体相似，
-        # 但任务查询路径和响应结构不同，因此只共享本地按需生成语义，不复用
-        # 供应商客户端，避免协议差异渗入素材编排层。
-        return _download_videos_metaso_minimax_on_demand(
-            task_id=task_id,
-            search_terms=search_terms,
-            video_aspect=video_aspect,
-            audio_duration=audio_duration,
-            max_clip_duration=max_clip_duration,
-            material_directory=material_directory,
-        )
+
     if source == "openai_image":
         # 与 WaveSpeed 相同的按需付费语义：文生图按张计费，逐段生成、凑够
         # 所需时长立即停止。生成结果是一次性的本地图片文件，也不参与 24
@@ -2022,6 +1987,262 @@ def download_videos(
     return video_paths
 
 
+# ---------------------------------------------------------------------------
+# 付费 AI 视频源的按需生成
+#
+# 生成类素材源（WaveSpeed / 方舟 Seedance / OFox / MuAPI / 秘塔 MiniMax）
+# 的共同语义是「逐段生成、凑够所需配音时长立即停止」，避免为用不到的片段
+# 付费。它们的控制流此前是五份逐行复制的实现，只在错误类型、日志前缀与
+# 时长核算方式上有差异；这里收敛成一个泛型实现，差异用
+# ``_GeneratedVideoProvider`` 描述。
+#
+# 每个源仍保留一个同名薄包装函数：既有测试会直接按名字调用它们，并且通过
+# ``patch.object(<provider 模块>, "generate_videos")`` 打桩。因此 ``generate``
+# 必须是用 lambda 包装的**调用时**属性访问，不能在这里预先绑定函数对象，
+# 否则打桩会失效。
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _GeneratedVideoProvider:
+    """一个付费生成源的编排差异点。"""
+
+    provider_id: str
+    label: str
+    generate: Callable[..., List[MaterialInfo]]
+    validation_error: Callable[[str], Exception]
+    # 构造下载失败异常：``(message, remote_id) -> Exception``。各源的远端 ID
+    # 关键字不同（``task_id`` / ``prediction_id``），由工厂内部处理。
+    download_error: Callable[[str, str], Exception]
+    # True 表示用本地实测文件时长核算覆盖进度（仅 MuAPI）。
+    measure_downloaded_duration: bool = False
+
+
+def _generated_remote_id(error: BaseException) -> str:
+    """读取生成异常上携带的远端任务 ID。
+
+    多数源用 ``task_id``，WaveSpeed 用 ``prediction_id``；两者都在异常对象上
+    暴露为 ``task_id``（WaveSpeed 额外另存别名），这里优先取更具体的那个。
+    """
+    for attribute in ("task_id", "prediction_id"):
+        value = str(getattr(error, attribute, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _item_asset_id(item: MaterialInfo) -> str:
+    """从素材描述里取出远端任务 ID，用于失败恢复。"""
+    source_info = item.source_info if isinstance(item.source_info, dict) else {}
+    return str(source_info.get("asset_id") or "").strip()
+
+
+_GENERATED_VIDEO_PROVIDERS: dict[str, _GeneratedVideoProvider] = {
+    "wavespeed": _GeneratedVideoProvider(
+        provider_id="wavespeed",
+        label="WaveSpeed",
+        # 测试通过 patch("app.services.material.generate_videos_wavespeed") 打桩，
+        # 因此必须在调用时读取模块全局名字，而不是绑定函数对象。
+        generate=lambda **kwargs: generate_videos_wavespeed(**kwargs),
+        # WaveSpeed 的循环参数校验沿用项目既有的裸 ValueError 约定。
+        validation_error=ValueError,
+        download_error=lambda message, remote_id: WaveSpeedDownloadError(
+            message, prediction_id=remote_id
+        ),
+    ),
+    "volcengine_seedance": _GeneratedVideoProvider(
+        provider_id="volcengine_seedance",
+        label="Seedance",
+        generate=lambda **kwargs: volcengine_seedance.generate_videos(**kwargs),
+        validation_error=volcengine_seedance.VolcEngineSeedanceError,
+        download_error=lambda message, remote_id: (
+            volcengine_seedance.VolcEngineSeedanceDownloadError(
+                message, task_id=remote_id
+            )
+        ),
+    ),
+    "ofox": _GeneratedVideoProvider(
+        provider_id="ofox",
+        label="OFox",
+        generate=lambda **kwargs: ofox.generate_videos(**kwargs),
+        validation_error=ofox.OFoxError,
+        download_error=lambda message, remote_id: ofox.OFoxDownloadError(
+            message, task_id=remote_id
+        ),
+    ),
+    "muapi": _GeneratedVideoProvider(
+        provider_id="muapi",
+        label="MuAPI",
+        generate=lambda **kwargs: muapi.generate_videos(**kwargs),
+        validation_error=muapi.MuAPIError,
+        download_error=lambda message, remote_id: muapi.MuAPIDownloadError(
+            message, task_id=remote_id
+        ),
+        # MuAPI 是唯一按下载文件实测时长核算覆盖进度的源。
+        measure_downloaded_duration=True,
+    ),
+    "metaso_minimax": _GeneratedVideoProvider(
+        provider_id="metaso_minimax",
+        label="Metaso MiniMax",
+        generate=lambda **kwargs: metaso_minimax.generate_videos(**kwargs),
+        validation_error=metaso_minimax.MetasoMiniMaxError,
+        download_error=lambda message, remote_id: (
+            metaso_minimax.MetasoMiniMaxDownloadError(message, task_id=remote_id)
+        ),
+    ),
+}
+
+
+def _download_generated_videos_on_demand(
+    *,
+    provider: _GeneratedVideoProvider,
+    task_id: str,
+    search_terms: List[str],
+    video_aspect: VideoAspect,
+    audio_duration: float,
+    max_clip_duration: int,
+    material_directory: str,
+) -> List[str]:
+    """
+    逐段生成付费素材，凑够所需配音时长后立即停止下单。
+
+    每个关键词天然对应一个脚本片段，生成即付费：先全量生成再挑选会为用不到
+    的片段付费。这里每生成一段就立刻下载并累计有效时长（按片段时长封顶），
+    覆盖所需配音时长后不再触发新的生成请求。
+
+    两个控制循环次数的参数必须在生成前校验：NaN/Infinity 会让
+    ``total_duration >= required_duration`` 永远不成立，非正片段时长会让累计值
+    无法增长，两者都可能为全部关键词创建无用的付费任务。
+
+    远端明确失败的片段可跳过；**状态不明或下载失败**的付费任务必须携带远端
+    ID 终止本地任务，绝不重试下单。
+    """
+    video_paths: List[str] = []
+    material_sources: list[dict[str, Any]] = []
+
+    try:
+        required_duration = float(audio_duration)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise provider.validation_error(
+            f"{provider.label} audio duration must be a finite number"
+        ) from exc
+    if not math.isfinite(required_duration):
+        raise provider.validation_error(
+            f"{provider.label} audio duration must be a finite number"
+        )
+    if required_duration <= 0:
+        logger.warning(
+            f"skip {provider.label} paid generation because required audio "
+            f"duration is not positive: duration={required_duration}"
+        )
+        _persist_material_sources(task_id, material_sources)
+        return video_paths
+
+    try:
+        clip_duration = int(max_clip_duration)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise provider.validation_error(
+            f"{provider.label} clip duration must be a positive integer"
+        ) from exc
+    if clip_duration <= 0:
+        raise provider.validation_error(
+            f"{provider.label} clip duration must be a positive integer"
+        )
+
+    total_duration = 0.0
+    for search_term in search_terms:
+        try:
+            video_items = provider.generate(
+                search_term=search_term,
+                minimum_duration=clip_duration,
+                video_aspect=video_aspect,
+            )
+        except VideoProviderUnconfirmedTaskError as exc:
+            # 已提交的付费任务状态不明：远端可能仍在运行或已经完成并计费。
+            # 继续为后续关键词下单会造成重复生成和重复扣费，因此就地停止，
+            # 把远端 ID 交给任务层写入失败状态，供用户找回产物。
+            logger.error(
+                f"stop submitting new {provider.label} tasks because the last "
+                f"paid task is unconfirmed: id="
+                f"{_generated_remote_id(exc) or 'unknown'}, detail={exc}"
+            )
+            _persist_material_sources(task_id, material_sources)
+            raise
+        except VideoProviderError as exc:
+            logger.error(
+                f"{provider.label} generation failed before completion: {exc}"
+            )
+            _persist_material_sources(task_id, material_sources)
+            raise
+
+        for item in video_items:
+            saved_video_path = _save_generated_video_with_retry(
+                item.url, material_directory, provider.provider_id
+            )
+            if not saved_video_path:
+                # 远端任务已完成并产生费用，本地下载失败时必须把远端任务 ID
+                # 带回任务状态，便于用户去对应控制台找回结果。这里直接抛出
+                # 专用错误，同时阻止后续关键词继续创建新的付费任务。
+                remote_id = _item_asset_id(item)
+                _persist_material_sources(task_id, material_sources)
+                raise provider.download_error(
+                    f"{provider.label} generated a paid video but the result "
+                    f"could not be downloaded: id={remote_id or 'unknown'}",
+                    remote_id,
+                )
+            logger.info(f"video saved: {saved_video_path}")
+            video_paths.append(saved_video_path)
+            try:
+                material_sources.append(
+                    _material_source_record(item, saved_video_path)
+                )
+            except Exception as source_error:
+                # 与库存源一致：来源记录异常不能把已经付费生成并成功下载的
+                # 素材当作失败，更不能阻断视频生成。
+                logger.warning(
+                    "failed to prepare generated material source record: "
+                    f"provider={provider.provider_id}, "
+                    f"error={type(source_error).__name__}, detail={source_error}"
+                )
+
+            if provider.measure_downloaded_duration:
+                try:
+                    item_duration = _get_downloaded_video_duration(saved_video_path)
+                except Exception as duration_error:
+                    remote_id = _item_asset_id(item)
+                    _persist_material_sources(task_id, material_sources)
+                    raise provider.download_error(
+                        f"{provider.label} generated a paid video but its "
+                        f"downloaded duration could not be measured: "
+                        f"id={remote_id or 'unknown'}",
+                        remote_id,
+                    ) from duration_error
+            else:
+                item_duration = item.duration
+
+            # 本地成片只使用用户选择的片段长度；即使远端因最短时长约束生成
+            # 了更长素材，也不能把未使用部分计入覆盖时长并少生成必要画面。
+            total_duration += min(clip_duration, item_duration)
+            # 用 >= 判断：累计时长恰好等于所需时长时已经够用，再生成会多付
+            # 一次费用。内外两处判断必须保持同一语义。
+            if total_duration >= required_duration:
+                break
+        if total_duration >= required_duration:
+            logger.info(
+                f"generated {provider.label} materials cover the required "
+                f"duration; stop submitting paid tasks: "
+                f"generated={total_duration:.1f}s, "
+                f"required={required_duration:.1f}s"
+            )
+            break
+
+    logger.success(
+        f"generated and downloaded {len(video_paths)} {provider.label} videos"
+    )
+    _persist_material_sources(task_id, material_sources)
+    return video_paths
+
+
 def _download_videos_wavespeed_on_demand(
     *,
     task_id: str,
@@ -2031,100 +2252,16 @@ def _download_videos_wavespeed_on_demand(
     max_clip_duration: int,
     material_directory: str,
 ) -> List[str]:
-    """
-    按脚本片段顺序逐段生成 WaveSpeed 素材，凑够所需总时长立即停止。
-
-    每个关键词天然对应一个脚本片段，生成即付费：先全量生成再挑选会为
-    用不到的片段付费。这里每生成一段就立刻下载并累计有效时长（与库存
-    流程一致，按片段时长封顶），累计覆盖所需配音时长后不再触发新的生成
-    请求。远端明确失败的片段可跳过；状态不明或下载失败的付费任务必须
-    保留 ID 并终止本地任务。
-    """
-    video_paths: List[str] = []
-    material_sources: list[dict[str, Any]] = []
-
-    try:
-        required_duration = float(audio_duration)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("WaveSpeed audio duration must be finite") from exc
-    if not math.isfinite(required_duration):
-        raise ValueError("WaveSpeed audio duration must be finite")
-    if required_duration <= 0:
-        logger.warning(
-            "skip WaveSpeed paid generation because required audio duration "
-            f"is not positive: duration={required_duration}"
-        )
-        _persist_material_sources(task_id, material_sources)
-        return video_paths
-
-    try:
-        clip_duration = int(max_clip_duration)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("WaveSpeed clip duration must be a positive integer") from exc
-    if clip_duration <= 0:
-        raise ValueError("WaveSpeed clip duration must be a positive integer")
-
-    total_duration = 0.0
-    for search_term in search_terms:
-        try:
-            video_items = generate_videos_wavespeed(
-                search_term=search_term,
-                minimum_duration=clip_duration,
-                video_aspect=video_aspect,
-            )
-        except WaveSpeedUnconfirmedTaskError as e:
-            # 已提交的付费任务状态不明：远端可能仍在运行或已经完成并计费。
-            # 继续为后续关键词下单会造成重复生成和重复扣费，因此就地停止，
-            # 把 prediction id 交给任务层写入失败状态，供用户找回产物。
-            logger.error(
-                "stop submitting new wavespeed tasks, the last submitted task "
-                f"is unconfirmed: prediction_id={e.prediction_id or 'unknown'}, "
-                f"detail={e}"
-            )
-            _persist_material_sources(task_id, material_sources)
-            raise
-        for item in video_items:
-            saved_video_path = _save_generated_video_with_retry(
-                item.url, material_directory, "wavespeed"
-            )
-            if not saved_video_path:
-                source_info = (
-                    item.source_info if isinstance(item.source_info, dict) else {}
-                )
-                prediction_id = str(source_info.get("asset_id") or "").strip()
-                _persist_material_sources(task_id, material_sources)
-                raise WaveSpeedDownloadError(
-                    "WaveSpeed generated a paid video but the result could not be "
-                    f"downloaded: id={prediction_id or 'unknown'}",
-                    prediction_id=prediction_id,
-                )
-            logger.info(f"video saved: {saved_video_path}")
-            video_paths.append(saved_video_path)
-            try:
-                material_sources.append(_material_source_record(item, saved_video_path))
-            except Exception as source_error:
-                # 与库存源一致：来源记录异常不能把已经付费生成并成功下载的
-                # 素材当作失败，更不能阻断视频生成。
-                logger.warning(
-                    "failed to prepare material source record: "
-                    f"provider={item.provider}, "
-                    f"error={type(source_error).__name__}, detail={source_error}"
-                )
-            total_duration += min(clip_duration, item.duration)
-            # 用 >= 判断:累计时长恰好等于所需时长时已经够用,再生成会
-            # 多付一次费用。内外两处判断必须保持同一语义。
-            if total_duration >= required_duration:
-                break
-        if total_duration >= required_duration:
-            logger.info(
-                "generated materials cover the required duration, stop "
-                f"generating more clips: generated={total_duration:.1f}s, "
-                f"required={required_duration:.1f}s"
-            )
-            break
-    logger.success(f"generated and downloaded {len(video_paths)} videos")
-    _persist_material_sources(task_id, material_sources)
-    return video_paths
+    """按脚本片段顺序逐段生成 WaveSpeed 素材，凑够所需总时长立即停止。"""
+    return _download_generated_videos_on_demand(
+        provider=_GENERATED_VIDEO_PROVIDERS["wavespeed"],
+        task_id=task_id,
+        search_terms=search_terms,
+        video_aspect=video_aspect,
+        audio_duration=audio_duration,
+        max_clip_duration=max_clip_duration,
+        material_directory=material_directory,
+    )
 
 
 def _download_videos_seedance_on_demand(
@@ -2137,107 +2274,15 @@ def _download_videos_seedance_on_demand(
     material_directory: str,
 ) -> List[str]:
     """顺序生成方舟 Seedance 素材，覆盖配音时长后立即停止付费下单。"""
-    video_paths: List[str] = []
-    material_sources: list[dict[str, Any]] = []
-
-    # 付费生成循环必须先验证控制循环次数的两个时长。NaN/Infinity 会让
-    # ``total_duration >= audio_duration`` 永远不成立，而非正片段时长会让
-    # 累计值无法增长，两者都可能为全部关键词创建无用的付费任务。
-    try:
-        required_duration = float(audio_duration)
-    except (TypeError, ValueError) as exc:
-        raise volcengine_seedance.VolcEngineSeedanceError(
-            "Seedance audio duration must be a finite number"
-        ) from exc
-    if not math.isfinite(required_duration):
-        raise volcengine_seedance.VolcEngineSeedanceError(
-            "Seedance audio duration must be a finite number"
-        )
-    if required_duration <= 0:
-        logger.warning(
-            "skip Seedance paid generation because required audio duration is "
-            f"not positive: duration={required_duration}"
-        )
-        _persist_material_sources(task_id, material_sources)
-        return video_paths
-
-    try:
-        clip_duration = int(max_clip_duration)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise volcengine_seedance.VolcEngineSeedanceError(
-            "Seedance clip duration must be a positive integer"
-        ) from exc
-    if clip_duration <= 0:
-        raise volcengine_seedance.VolcEngineSeedanceError(
-            "Seedance clip duration must be a positive integer"
-        )
-
-    total_duration = 0.0
-    for search_term in search_terms:
-        try:
-            video_items = volcengine_seedance.generate_videos(
-                search_term=search_term,
-                minimum_duration=clip_duration,
-                video_aspect=video_aspect,
-            )
-        except volcengine_seedance.VolcEngineSeedanceUnconfirmedTaskError as exc:
-            # 远端付费任务仍可能成功。立即停止继续下单，并保留任务 ID，方便
-            # 用户随后在方舟控制台确认或找回结果。
-            logger.error(
-                "stop submitting new Seedance tasks because the last paid task "
-                f"is unconfirmed: task_id={exc.task_id or 'unknown'}, detail={exc}"
-            )
-            _persist_material_sources(task_id, material_sources)
-            raise
-        except volcengine_seedance.VolcEngineSeedanceError as exc:
-            logger.error(f"Seedance generation failed before completion: {exc}")
-            _persist_material_sources(task_id, material_sources)
-            raise
-
-        for item in video_items:
-            saved_video_path = _save_generated_video_with_retry(
-                item.url, material_directory, "volcengine_seedance"
-            )
-            if not saved_video_path:
-                # 远端任务已完成并产生费用，本地下载失败时必须把远端任务 ID
-                # 带回任务状态，便于用户去方舟控制台找回结果。这里直接抛出
-                # 专用错误，同时阻止后续关键词继续创建新的付费任务。
-                source_info = (
-                    item.source_info if isinstance(item.source_info, dict) else {}
-                )
-                remote_task_id = str(source_info.get("asset_id") or "").strip()
-                _persist_material_sources(task_id, material_sources)
-                raise volcengine_seedance.VolcEngineSeedanceDownloadError(
-                    "Seedance generated a paid video but the result could not be "
-                    f"downloaded: id={remote_task_id or 'unknown'}",
-                    task_id=remote_task_id,
-                )
-            logger.info(f"video saved: {saved_video_path}")
-            video_paths.append(saved_video_path)
-            try:
-                material_sources.append(_material_source_record(item, saved_video_path))
-            except Exception as source_error:
-                logger.warning(
-                    "failed to prepare generated material source record: "
-                    f"provider=volcengine_seedance, "
-                    f"error={type(source_error).__name__}, detail={source_error}"
-                )
-            total_duration += min(clip_duration, item.duration)
-            if total_duration >= required_duration:
-                break
-        if total_duration >= required_duration:
-            logger.info(
-                "generated Seedance materials cover the required duration; stop "
-                f"submitting paid tasks: generated={total_duration:.1f}s, "
-                f"required={required_duration:.1f}s"
-            )
-            break
-
-    logger.success(
-        f"generated and downloaded {len(video_paths)} Volcano Engine Seedance videos"
+    return _download_generated_videos_on_demand(
+        provider=_GENERATED_VIDEO_PROVIDERS["volcengine_seedance"],
+        task_id=task_id,
+        search_terms=search_terms,
+        video_aspect=video_aspect,
+        audio_duration=audio_duration,
+        max_clip_duration=max_clip_duration,
+        material_directory=material_directory,
     )
-    _persist_material_sources(task_id, material_sources)
-    return video_paths
 
 
 def _download_videos_ofox_on_demand(
@@ -2250,99 +2295,15 @@ def _download_videos_ofox_on_demand(
     material_directory: str,
 ) -> List[str]:
     """顺序生成 OFox 素材，覆盖配音时长后立即停止付费下单。"""
-    video_paths: List[str] = []
-    material_sources: list[dict[str, Any]] = []
-
-    # 付费生成循环必须先验证控制循环次数的两个时长。NaN/Infinity 会让
-    # ``total_duration >= audio_duration`` 永远不成立，而非正片段时长会让
-    # 累计值无法增长，两者都可能为全部关键词创建无用的付费任务。
-    try:
-        required_duration = float(audio_duration)
-    except (TypeError, ValueError) as exc:
-        raise ofox.OFoxError("OFox audio duration must be a finite number") from exc
-    if not math.isfinite(required_duration):
-        raise ofox.OFoxError("OFox audio duration must be a finite number")
-    if required_duration <= 0:
-        logger.warning(
-            "skip OFox paid generation because required audio duration is "
-            f"not positive: duration={required_duration}"
-        )
-        _persist_material_sources(task_id, material_sources)
-        return video_paths
-
-    try:
-        clip_duration = int(max_clip_duration)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ofox.OFoxError("OFox clip duration must be a positive integer") from exc
-    if clip_duration <= 0:
-        raise ofox.OFoxError("OFox clip duration must be a positive integer")
-
-    total_duration = 0.0
-    for search_term in search_terms:
-        try:
-            video_items = ofox.generate_videos(
-                search_term=search_term,
-                minimum_duration=clip_duration,
-                video_aspect=video_aspect,
-            )
-        except ofox.OFoxUnconfirmedTaskError as exc:
-            # 远端付费任务仍可能成功。立即停止继续下单，并保留任务 ID，方便
-            # 用户随后在 OFox 控制台确认或找回结果。
-            logger.error(
-                "stop submitting new OFox tasks because the last paid task "
-                f"is unconfirmed: task_id={exc.task_id or 'unknown'}, detail={exc}"
-            )
-            _persist_material_sources(task_id, material_sources)
-            raise
-        except ofox.OFoxError as exc:
-            logger.error(f"OFox generation failed before completion: {exc}")
-            _persist_material_sources(task_id, material_sources)
-            raise
-
-        # 单个关键词被远端明确判失败（如触发内容审核）时返回空列表：任务已
-        # 结束、无计费悬念，跳过该片段继续生成后续关键词。
-        for item in video_items:
-            saved_video_path = _save_generated_video_with_retry(
-                item.url, material_directory, "ofox"
-            )
-            if not saved_video_path:
-                # 远端任务已完成并产生费用，本地下载失败时必须把远端任务 ID
-                # 带回任务状态，便于用户去 OFox 控制台找回结果。这里直接抛出
-                # 专用错误，同时阻止后续关键词继续创建新的付费任务。
-                source_info = (
-                    item.source_info if isinstance(item.source_info, dict) else {}
-                )
-                remote_task_id = str(source_info.get("asset_id") or "").strip()
-                _persist_material_sources(task_id, material_sources)
-                raise ofox.OFoxDownloadError(
-                    "OFox generated a paid video but the result could not be "
-                    f"downloaded: id={remote_task_id or 'unknown'}",
-                    task_id=remote_task_id,
-                )
-            logger.info(f"video saved: {saved_video_path}")
-            video_paths.append(saved_video_path)
-            try:
-                material_sources.append(_material_source_record(item, saved_video_path))
-            except Exception as source_error:
-                logger.warning(
-                    "failed to prepare generated material source record: "
-                    f"provider=ofox, "
-                    f"error={type(source_error).__name__}, detail={source_error}"
-                )
-            total_duration += min(clip_duration, item.duration)
-            if total_duration >= required_duration:
-                break
-        if total_duration >= required_duration:
-            logger.info(
-                "generated OFox materials cover the required duration; stop "
-                f"submitting paid tasks: generated={total_duration:.1f}s, "
-                f"required={required_duration:.1f}s"
-            )
-            break
-
-    logger.success(f"generated and downloaded {len(video_paths)} OFox videos")
-    _persist_material_sources(task_id, material_sources)
-    return video_paths
+    return _download_generated_videos_on_demand(
+        provider=_GENERATED_VIDEO_PROVIDERS["ofox"],
+        task_id=task_id,
+        search_terms=search_terms,
+        video_aspect=video_aspect,
+        audio_duration=audio_duration,
+        max_clip_duration=max_clip_duration,
+        material_directory=material_directory,
+    )
 
 
 def _download_videos_muapi_on_demand(
@@ -2355,114 +2316,15 @@ def _download_videos_muapi_on_demand(
     material_directory: str,
 ) -> List[str]:
     """Generate MuAPI materials until the narration duration is covered."""
-    video_paths: List[str] = []
-    material_sources: list[dict[str, Any]] = []
-
-    try:
-        required_duration = float(audio_duration)
-    except (TypeError, ValueError) as exc:
-        raise muapi.MuAPIError(
-            "MuAPI audio duration must be a finite number"
-        ) from exc
-    if not math.isfinite(required_duration):
-        raise muapi.MuAPIError("MuAPI audio duration must be a finite number")
-    if required_duration <= 0:
-        logger.warning(
-            "skip MuAPI paid generation because required audio duration is "
-            f"not positive: duration={required_duration}"
-        )
-        _persist_material_sources(task_id, material_sources)
-        return video_paths
-
-    try:
-        clip_duration = int(max_clip_duration)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise muapi.MuAPIError(
-            "MuAPI clip duration must be a positive integer"
-        ) from exc
-    if clip_duration <= 0:
-        raise muapi.MuAPIError("MuAPI clip duration must be a positive integer")
-
-    total_duration = 0.0
-    for search_term in search_terms:
-        try:
-            video_items = muapi.generate_videos(
-                search_term=search_term,
-                minimum_duration=clip_duration,
-                video_aspect=video_aspect,
-            )
-        except muapi.MuAPIUnconfirmedTaskError as exc:
-            # An ambiguous paid submission must stop the loop: retrying with the
-            # next keyword could create a duplicate charge.  The task ID is kept
-            # for task-service recovery when the provider returned one.
-            logger.error(
-                "stop submitting new MuAPI tasks because the last paid task "
-                f"is unconfirmed: task_id={exc.task_id or 'unknown'}, "
-                f"detail={exc}"
-            )
-            _persist_material_sources(task_id, material_sources)
-            raise
-        except muapi.MuAPIError as exc:
-            logger.error(f"MuAPI generation failed before completion: {exc}")
-            _persist_material_sources(task_id, material_sources)
-            raise
-
-        for item in video_items:
-            saved_video_path = _save_generated_video_with_retry(
-                item.url, material_directory, "muapi"
-            )
-            if not saved_video_path:
-                # The remote job completed and may already have incurred a
-                # charge.  Do not submit a replacement task after download
-                # failure; return the remote ID for manual recovery instead.
-                source_info = (
-                    item.source_info if isinstance(item.source_info, dict) else {}
-                )
-                remote_task_id = str(source_info.get("asset_id") or "").strip()
-                _persist_material_sources(task_id, material_sources)
-                raise muapi.MuAPIDownloadError(
-                    "MuAPI generated a paid video but the result could not be "
-                    f"downloaded: id={remote_task_id or 'unknown'}",
-                    task_id=remote_task_id,
-                )
-            logger.info(f"video saved: {saved_video_path}")
-            video_paths.append(saved_video_path)
-            try:
-                material_sources.append(_material_source_record(item, saved_video_path))
-            except Exception as source_error:
-                logger.warning(
-                    "failed to prepare generated material source record: "
-                    f"provider=muapi, error={type(source_error).__name__}, "
-                    f"detail={source_error}"
-                )
-            try:
-                downloaded_duration = _get_downloaded_video_duration(saved_video_path)
-            except Exception as duration_error:
-                source_info = (
-                    item.source_info if isinstance(item.source_info, dict) else {}
-                )
-                remote_task_id = str(source_info.get("asset_id") or "").strip()
-                _persist_material_sources(task_id, material_sources)
-                raise muapi.MuAPIDownloadError(
-                    "MuAPI generated a paid video but its downloaded duration "
-                    "could not be measured: "
-                    f"id={remote_task_id or 'unknown'}",
-                    task_id=remote_task_id,
-                ) from duration_error
-            total_duration += min(clip_duration, downloaded_duration)
-            if total_duration >= required_duration:
-                break
-        if total_duration >= required_duration:
-            logger.info(
-                "generated MuAPI materials cover the required duration; stop "
-                f"submitting paid tasks: generated={total_duration:.1f}s, "
-                f"required={required_duration:.1f}s"
-            )
-            break
-
-    logger.success(f"generated and downloaded {len(video_paths)} MuAPI videos")
-    _persist_material_sources(task_id, material_sources)
-    return video_paths
+    return _download_generated_videos_on_demand(
+        provider=_GENERATED_VIDEO_PROVIDERS["muapi"],
+        task_id=task_id,
+        search_terms=search_terms,
+        video_aspect=video_aspect,
+        audio_duration=audio_duration,
+        max_clip_duration=max_clip_duration,
+        material_directory=material_directory,
+    )
 
 
 def _download_videos_metaso_minimax_on_demand(
@@ -2475,108 +2337,15 @@ def _download_videos_metaso_minimax_on_demand(
     material_directory: str,
 ) -> List[str]:
     """顺序生成秘塔 MiniMax 素材，覆盖配音时长后立即停止付费下单。"""
-    video_paths: List[str] = []
-    material_sources: list[dict[str, Any]] = []
-
-    # 远端最短生成 4 秒，但本地仍按用户片段时长裁剪和累计。提前验证循环
-    # 控制参数，避免 NaN、Infinity 或非正数让停止条件永远无法满足，进而把
-    # 所有关键词都提交为付费任务。
-    try:
-        required_duration = float(audio_duration)
-    except (TypeError, ValueError) as exc:
-        raise metaso_minimax.MetasoMiniMaxError(
-            "Metaso MiniMax audio duration must be a finite number"
-        ) from exc
-    if not math.isfinite(required_duration):
-        raise metaso_minimax.MetasoMiniMaxError(
-            "Metaso MiniMax audio duration must be a finite number"
-        )
-    if required_duration <= 0:
-        logger.warning(
-            "skip Metaso MiniMax paid generation because required audio duration "
-            f"is not positive: duration={required_duration}"
-        )
-        _persist_material_sources(task_id, material_sources)
-        return video_paths
-
-    try:
-        clip_duration = int(max_clip_duration)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise metaso_minimax.MetasoMiniMaxError(
-            "Metaso MiniMax clip duration must be a positive integer"
-        ) from exc
-    if clip_duration <= 0:
-        raise metaso_minimax.MetasoMiniMaxError(
-            "Metaso MiniMax clip duration must be a positive integer"
-        )
-
-    total_duration = 0.0
-    for search_term in search_terms:
-        try:
-            video_items = metaso_minimax.generate_videos(
-                search_term=search_term,
-                minimum_duration=clip_duration,
-                video_aspect=video_aspect,
-            )
-        except metaso_minimax.MetasoMiniMaxUnconfirmedTaskError as exc:
-            # 请求或轮询状态不明时，远端任务仍可能成功并计费。立即停止整个
-            # 生成循环，防止后续关键词继续下单，并把任务 ID 交给任务服务保存。
-            logger.error(
-                "stop submitting new Metaso MiniMax tasks because the last paid "
-                f"task is unconfirmed: task_id={exc.task_id or 'unknown'}, "
-                f"detail={exc}"
-            )
-            _persist_material_sources(task_id, material_sources)
-            raise
-        except metaso_minimax.MetasoMiniMaxError as exc:
-            logger.error(f"Metaso MiniMax generation failed before completion: {exc}")
-            _persist_material_sources(task_id, material_sources)
-            raise
-
-        for item in video_items:
-            saved_video_path = _save_generated_video_with_retry(
-                item.url, material_directory, "metaso_minimax"
-            )
-            if not saved_video_path:
-                # 生成成功已产生费用，下载失败时不能继续创建新任务来替代。
-                # 抛出携带远端 ID 的专用错误，供任务状态和人工恢复使用。
-                source_info = (
-                    item.source_info if isinstance(item.source_info, dict) else {}
-                )
-                remote_task_id = str(source_info.get("asset_id") or "").strip()
-                _persist_material_sources(task_id, material_sources)
-                raise metaso_minimax.MetasoMiniMaxDownloadError(
-                    "Metaso MiniMax generated a paid video but the result could "
-                    f"not be downloaded: id={remote_task_id or 'unknown'}",
-                    task_id=remote_task_id,
-                )
-            logger.info(f"video saved: {saved_video_path}")
-            video_paths.append(saved_video_path)
-            try:
-                material_sources.append(_material_source_record(item, saved_video_path))
-            except Exception as source_error:
-                logger.warning(
-                    "failed to prepare generated material source record: "
-                    f"provider=metaso_minimax, error={type(source_error).__name__}, "
-                    f"detail={source_error}"
-                )
-
-            # 本地成片只使用用户选择的片段长度；即使 H3 因最短时长约束生成
-            # 了更长素材，也不能把未使用部分计入覆盖时长并少生成必要画面。
-            total_duration += min(clip_duration, item.duration)
-            if total_duration >= required_duration:
-                break
-        if total_duration >= required_duration:
-            logger.info(
-                "generated Metaso MiniMax materials cover the required duration; "
-                f"stop submitting paid tasks: generated={total_duration:.1f}s, "
-                f"required={required_duration:.1f}s"
-            )
-            break
-
-    logger.success(f"generated and downloaded {len(video_paths)} Metaso MiniMax videos")
-    _persist_material_sources(task_id, material_sources)
-    return video_paths
+    return _download_generated_videos_on_demand(
+        provider=_GENERATED_VIDEO_PROVIDERS["metaso_minimax"],
+        task_id=task_id,
+        search_terms=search_terms,
+        video_aspect=video_aspect,
+        audio_duration=audio_duration,
+        max_clip_duration=max_clip_duration,
+        material_directory=material_directory,
+    )
 
 
 def _download_videos_by_script_order(

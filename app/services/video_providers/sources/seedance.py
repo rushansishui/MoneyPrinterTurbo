@@ -21,7 +21,9 @@ from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect
 from app.services.video_providers import client, http_util, polling
 from app.services.video_providers.errors import (
+    VideoProviderDownloadError,
     VideoProviderError,
+    VideoProviderUnconfirmedTaskError,
 )
 from app.services.video_providers.spec import VideoProviderSpec
 
@@ -47,13 +49,19 @@ SUPPORTED_RESOLUTIONS = frozenset({"480p", "720p", "1080p"})
 
 class VolcEngineSeedanceError(VideoProviderError):
     """确定性的配置、请求或响应错误。"""
+    # 供任务层从异常反查 provider spec，生成失败详情时无需逐个 isinstance。
+    provider_id = "volcengine_seedance"
 
 
-class VolcEngineSeedanceUnconfirmedTaskError(VolcEngineSeedanceError):
+class VolcEngineSeedanceUnconfirmedTaskError(
+    VolcEngineSeedanceError, VideoProviderUnconfirmedTaskError
+):
     """远端可能已创建付费任务，但本机无法确认其最终状态。"""
 
 
-class VolcEngineSeedanceDownloadError(VolcEngineSeedanceError):
+class VolcEngineSeedanceDownloadError(
+    VolcEngineSeedanceError, VideoProviderDownloadError
+):
     """远端付费任务已成功，但生成的视频未能下载到本机。"""
 
 
@@ -68,7 +76,9 @@ SPEC = VideoProviderSpec(
     supports_native_audio=False,
     measure_downloaded_duration=False,
     remote_task_id_attr="task_id",
-    error_details_key="volcengine_seedance_task_id",
+    missing_credentials_message=(
+        "Volcano Engine Seedance requires an Ark API key"
+    ),
 )
 
 

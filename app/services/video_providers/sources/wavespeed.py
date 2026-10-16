@@ -19,6 +19,8 @@ import time
 from typing import Any, List
 
 import requests
+from collections.abc import Mapping
+
 from loguru import logger
 
 from app.config import config
@@ -68,6 +70,9 @@ class WaveSpeedUnconfirmedTaskError(VideoProviderUnconfirmedTaskError):
     并把已提交的 prediction id 传给任务状态供人工找回。
     """
 
+    # 供任务层从异常反查 provider spec。
+    provider_id = "wavespeed"
+
     def __init__(self, message: str, prediction_id: str = ""):
         super().__init__(message, task_id=prediction_id)
         # 该源对外暴露的是 ``prediction_id``，历史调用方与测试都按这个名字读取。
@@ -76,6 +81,9 @@ class WaveSpeedUnconfirmedTaskError(VideoProviderUnconfirmedTaskError):
 
 class WaveSpeedDownloadError(VideoProviderDownloadError):
     """A paid prediction completed, but its video could not be saved locally."""
+
+    # 供任务层从异常反查 provider spec。
+    provider_id = "wavespeed"
 
     def __init__(self, message: str, prediction_id: str = ""):
         super().__init__(message, task_id=prediction_id)
@@ -86,7 +94,10 @@ SPEC = VideoProviderSpec(
     provider_id="wavespeed",
     default_label="WaveSpeed AI",
     module="app.services.video_providers.sources.wavespeed",
-    legacy_module="app.services.material",
+    # 该源的编排入口仍在 material 服务里（generate_videos_wavespeed），且没有
+    # 独立的 ``app/services/wavespeed.py`` 垫片，因此这里不声明 legacy_module：
+    # resolve() 直接用本模块。测试打桩的是 material 模块的全局名字，与此无关。
+    legacy_module="",
     group="ai_video",
     requires_charge_confirmation=True,
     supports_image_to_video=False,
@@ -96,6 +107,26 @@ SPEC = VideoProviderSpec(
     remote_task_id_attr="prediction_id",
     error_details_key="wavespeed_prediction_id",
 )
+
+
+def get_api_key(settings: Mapping[str, Any] | None = None) -> str:
+    """读取 WaveSpeed 凭据（列表取第一个，与 material 的 Key 轮换一致）。"""
+    from app.services import material
+
+    configured = material.get_api_key("wavespeed_api_keys")
+    return str(configured or "").strip()
+
+
+def is_enabled(settings: Mapping[str, Any] | None = None) -> bool:
+    """是否具备可用的 WaveSpeed 凭据。
+
+    读取失败（例如配置项缺失时 material.get_api_key 会抛 ValueError）一律
+    视为未启用，而不是把异常传播给 preflight / WebUI 门禁。
+    """
+    try:
+        return bool(get_api_key(settings))
+    except Exception:
+        return False
 
 
 def _wavespeed_status_code(response: Any) -> int:

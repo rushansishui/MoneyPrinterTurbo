@@ -11,6 +11,7 @@
 """
 
 from app.services.video_providers.sources.seedance import (  # noqa: F401
+    SPEC,
     ACTIVE_STATUSES,
     DEFAULT_BASE_URL,
     DEFAULT_MAX_DURATION_SECONDS,

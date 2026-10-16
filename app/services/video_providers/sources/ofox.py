@@ -19,7 +19,9 @@ from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect
 from app.services.video_providers import client, http_util, polling
 from app.services.video_providers.errors import (
+    VideoProviderDownloadError,
     VideoProviderError,
+    VideoProviderUnconfirmedTaskError,
 )
 from app.services.video_providers.spec import VideoProviderSpec
 
@@ -51,13 +53,15 @@ ACTIVE_STATUSES = frozenset({"pending", "queued", "in_progress"})
 
 class OFoxError(VideoProviderError):
     """确定性的配置、请求或响应错误。"""
+    # 供任务层从异常反查 provider spec。
+    provider_id = "ofox"
 
 
-class OFoxUnconfirmedTaskError(OFoxError):
+class OFoxUnconfirmedTaskError(OFoxError, VideoProviderUnconfirmedTaskError):
     """远端可能已创建付费任务，但本机无法确认其最终状态。"""
 
 
-class OFoxDownloadError(OFoxError):
+class OFoxDownloadError(OFoxError, VideoProviderDownloadError):
     """远端付费任务已成功，但生成的视频未能下载到本机。"""
 
 
@@ -72,7 +76,9 @@ SPEC = VideoProviderSpec(
     supports_native_audio=False,
     measure_downloaded_duration=False,
     remote_task_id_attr="task_id",
-    error_details_key="ofox_task_id",
+    missing_credentials_message=(
+        "OFox video generation requires an OFox API key"
+    ),
 )
 
 

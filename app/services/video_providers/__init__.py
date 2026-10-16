@@ -15,6 +15,7 @@ from app.services.video_providers.errors import (
     VideoProviderUnconfirmedTaskError,
 )
 from app.services.video_providers.registry import (
+    all_provider_ids,
     all_specs,
     generate,
     get_spec,
@@ -30,6 +31,7 @@ __all__ = [
     "VideoProviderError",
     "VideoProviderSpec",
     "VideoProviderUnconfirmedTaskError",
+    "all_provider_ids",
     "all_specs",
     "generate",
     "get_spec",

@@ -22,7 +22,9 @@ from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect
 from app.services.video_providers import client, http_util, polling
 from app.services.video_providers.errors import (
+    VideoProviderDownloadError,
     VideoProviderError,
+    VideoProviderUnconfirmedTaskError,
 )
 from app.services.video_providers.spec import VideoProviderSpec
 
@@ -49,13 +51,15 @@ TERMINAL_FAILURE_STATUSES = frozenset(
 
 class MuAPIError(VideoProviderError):
     """Deterministic configuration, request, or response error."""
+    # 供任务层从异常反查 provider spec。
+    provider_id = "muapi"
 
 
-class MuAPIUnconfirmedTaskError(MuAPIError):
+class MuAPIUnconfirmedTaskError(MuAPIError, VideoProviderUnconfirmedTaskError):
     """The remote job may exist, but its final state cannot be confirmed."""
 
 
-class MuAPIDownloadError(MuAPIError):
+class MuAPIDownloadError(MuAPIError, VideoProviderDownloadError):
     """A billable job completed, but its output could not be downloaded."""
 
 
@@ -71,7 +75,9 @@ SPEC = VideoProviderSpec(
     # MuAPI 是唯一以本地实测文件时长核算素材时长的源。
     measure_downloaded_duration=True,
     remote_task_id_attr="task_id",
-    error_details_key="muapi_task_id",
+    missing_credentials_message=(
+        "MuAPI video generation requires a MuAPI API key"
+    ),
 )
 
 

@@ -104,14 +104,22 @@ def all_provider_ids(group: str | None = None) -> frozenset[str]:
 
 
 def resolve(provider_id: str) -> ModuleType:
-    """解析 provider 对应的模块对象，带缓存。未知 ID 抛 ``KeyError``。"""
+    """解析 provider 对应的模块对象，带缓存。未知 ID 抛 ``KeyError``。
+
+    声明了 ``legacy_module`` 时**优先**返回该模块（即 ``app/services/<x>.py``
+    的兼容垫片）。原因：这些路径是既有的公开地址，调用方与测试都按它打桩
+    （``patch.object(metaso_minimax, "is_enabled")``）。若这里改解析到
+    ``sources/<x>.py``，patch 会打在另一个模块对象上而静默失效，测试会在
+    「看似通过」的同时真的去读全局配置、甚至发出真实请求。
+    垫片本身 re-export 了 ``sources`` 的实现，因此两条路径行为一致。
+    """
     spec = get_spec(provider_id)
     if spec is None:
         raise KeyError(f"unknown video provider: {provider_id!r}")
     cached = _MODULES.get(spec.provider_id)
     if cached is not None:
         return cached
-    module = importlib.import_module(spec.module)
+    module = importlib.import_module(spec.legacy_module or spec.module)
     _MODULES[spec.provider_id] = module
     return module
 
