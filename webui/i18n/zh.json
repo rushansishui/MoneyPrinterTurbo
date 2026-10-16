@@ -601,6 +601,16 @@
     "kimi_code.oauth.region_mismatch": "当前凭证属于「{authorized}」区域，但所选 API Platform 为「{selected}」。请求将按凭证区域「{authorized}」发出；如需切换区域，请重新登录。",
     "kimi_code.oauth.network_error": "无法连接 Kimi 授权服务（网络错误）。请检查网络连接后重新发起登录。",
     "kimi_code.oauth.changed": "登录状态已在其他页面变更，本次授权已停止。请按需重新登录。",
-    "kimi_code.oauth.poll_retry": "检查授权状态时网络异常，正在自动重试……"
+    "kimi_code.oauth.poll_retry": "检查授权状态时网络异常，正在自动重试……",
+    "Volcano Engine Seedance 2.5": "火山引擎方舟 · Seedance 2.5",
+    "Volcano Engine Seedance 2.5 Billing Notice": "每生成一段视频均由火山引擎方舟按 {resolution} 规格计费。根据预估旁白时长与片段时长，大约会提交 {min}-{max} 个付费任务；凑够所需素材后立即停止。",
+    "Volcano Engine Seedance 2.5 Billing Notice Without Script": "每生成一段视频均由火山引擎方舟计费。填写或生成视频文案后可查看预估任务数量。",
+    "Volcano Engine Seedance 2.5 Generate Audio Help": "已开启原生音频生成：每段视频本身就包含声音（环境声、对白、音效），该部分会计入任务费用。",
+    "Confirm Volcano Engine Seedance 2.5 Charge": "我已了解火山引擎 Seedance 2.5 会创建付费任务",
+    "Confirm Volcano Engine Seedance 2.5 Charge Help": "Seedance 2.5 素材按脚本片段逐段提交，凑够旁白时长后立即停止；火山引擎方舟按实际提交的生成任务计费。",
+    "Confirm Volcano Engine Seedance 2.5 Charge Required": "请先确认火山引擎 Seedance 2.5 的生成费用，再开始生成视频。",
+    "Volcano Engine Seedance 2.5 Help": "通过火山引擎方舟官方 Seedance 2.5 API 按脚本关键词生成全新视频素材。支持 4-30 秒片段、4k 分辨率、首帧图生视频与原生音频生成；每段素材都是一个付费任务。",
+    "Volcano Engine Seedance API Key": "火山引擎方舟 API Key",
+    "Volcano Engine Seedance API Key Help": "留空时会复用 VOLCENGINE_ARK_API_KEY，或 LLM 设置里的共享 volcengine_api_key。"
   }
 }

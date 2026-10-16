@@ -30,6 +30,7 @@ _BUILTINS_LOADED = False
 # 顺序确定，也避免自动发现时 sources 反向 import 本模块造成循环导入。
 _BUILTIN_MODULES: tuple[str, ...] = (
     "app.services.video_providers.sources.seedance",
+    "app.services.video_providers.sources.seedance25",
     "app.services.video_providers.sources.ofox",
     "app.services.video_providers.sources.metaso_minimax",
     "app.services.video_providers.sources.muapi",

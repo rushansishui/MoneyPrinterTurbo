@@ -31,6 +31,8 @@ from app.services import (
     video,
     volcengine_seedance,
 )
+# Seedance 2.5 是本轮新增的源，没有历史模块路径，直接从 provider 包导入。
+from app.services.video_providers.sources import seedance25
 from app.services.video_providers.errors import (
     VideoProviderError,
     VideoProviderUnconfirmedTaskError,
@@ -2061,6 +2063,15 @@ _GENERATED_VIDEO_PROVIDERS: dict[str, _GeneratedVideoProvider] = {
             )
         ),
     ),
+    "seedance25": _GeneratedVideoProvider(
+        provider_id="seedance25",
+        label="Seedance 2.5",
+        generate=lambda **kwargs: seedance25.generate_videos(**kwargs),
+        validation_error=seedance25.Seedance25Error,
+        download_error=lambda message, remote_id: seedance25.Seedance25DownloadError(
+            message, task_id=remote_id
+        ),
+    ),
     "ofox": _GeneratedVideoProvider(
         provider_id="ofox",
         label="OFox",
@@ -2069,8 +2080,7 @@ _GENERATED_VIDEO_PROVIDERS: dict[str, _GeneratedVideoProvider] = {
         download_error=lambda message, remote_id: ofox.OFoxDownloadError(
             message, task_id=remote_id
         ),
-    ),
-    "muapi": _GeneratedVideoProvider(
+    ),    "muapi": _GeneratedVideoProvider(
         provider_id="muapi",
         label="MuAPI",
         generate=lambda **kwargs: muapi.generate_videos(**kwargs),

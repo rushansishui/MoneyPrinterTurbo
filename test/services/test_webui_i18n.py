@@ -22,6 +22,16 @@ PROVIDER_TIPS_PREFIXES = (
 # 避免把完全相同的品牌名复制十份，也避免长说明后续只更新部分语言。
 ENGLISH_FALLBACK_KEYS = frozenset(
     {
+        "Volcano Engine Seedance 2.5",
+        "Volcano Engine Seedance 2.5 Help",
+        "Volcano Engine Seedance 2.5 Billing Notice",
+        "Volcano Engine Seedance 2.5 Billing Notice Without Script",
+        "Volcano Engine Seedance 2.5 Generate Audio Help",
+        "Volcano Engine Seedance API Key",
+        "Volcano Engine Seedance API Key Help",
+        "Confirm Volcano Engine Seedance 2.5 Charge",
+        "Confirm Volcano Engine Seedance 2.5 Charge Help",
+        "Confirm Volcano Engine Seedance 2.5 Charge Required",
         "AI Video Quote Required",
         "AI Video Quote Retained For Retry",
         "AI Video Quote Estimate Incomplete",

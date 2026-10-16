@@ -65,6 +65,8 @@ from app.services import sonilo as sonilo_service
 from app.services import state as sm
 from app.services import task as tm
 from app.services import version_checker
+# Seedance 2.5 是本轮新增的源，没有历史模块路径，直接从 provider 包导入。
+from app.services.video_providers.sources import seedance25
 from app.utils.logging_utils import configure_terminal_logger
 from app.utils import utils
 
@@ -132,6 +134,7 @@ VIDEO_SOURCE_GROUPS = {
         "ofox",
         "loomloom",
         "volcengine_seedance",
+        "seedance25",
         "wavespeed",
         "muapi",
     ),
@@ -751,6 +754,7 @@ def _initialize_session_state():
         "loomloom_video_scene_autofill_digest": "",
         "wavespeed_confirm_charge": False,
         "volcengine_seedance_confirm_charge": False,
+        "seedance25_confirm_charge": False,
         "ofox_confirm_charge": False,
         "metaso_minimax_confirm_charge": False,
         "muapi_confirm_charge": False,
@@ -3927,6 +3931,62 @@ def _render_settings_dialog():
                 )
 
                 st.divider()
+                st.markdown(f"**{tr('Volcano Engine Seedance 2.5')}**")
+                st.caption(tr("Volcano Engine Seedance 2.5 Help"))
+                seedance25_api_key = st.text_input(
+                    tr("Volcano Engine Seedance API Key"),
+                    value=str(config.app.get("seedance25_api_key", "") or ""),
+                    type="password",
+                    help=tr("Volcano Engine Seedance API Key Help"),
+                    key="seedance25_api_key_input",
+                )
+                _set_runtime_config(
+                    "app", "seedance25_api_key", seedance25_api_key.strip()
+                )
+                configured_seedance25_model = str(
+                    config.app.get(
+                        "seedance25_model", seedance25.DEFAULT_MODEL_ID
+                    )
+                    or seedance25.DEFAULT_MODEL_ID
+                ).strip()
+                seedance25_model = st.text_input(
+                    tr("Volcano Engine Seedance Model"),
+                    value=(
+                        ""
+                        if configured_seedance25_model
+                        == seedance25.DEFAULT_MODEL_ID
+                        else configured_seedance25_model
+                    ),
+                    placeholder=seedance25.DEFAULT_MODEL_ID,
+                    key="seedance25_model_input",
+                )
+                _set_runtime_config(
+                    "app",
+                    "seedance25_model",
+                    seedance25_model.strip() or seedance25.DEFAULT_MODEL_ID,
+                )
+                configured_seedance25_base_url = str(
+                    config.app.get("seedance25_base_url", seedance25.DEFAULT_BASE_URL)
+                    or seedance25.DEFAULT_BASE_URL
+                ).strip()
+                seedance25_base_url = st.text_input(
+                    tr("Volcano Engine Ark Base URL"),
+                    value=(
+                        ""
+                        if configured_seedance25_base_url
+                        == seedance25.DEFAULT_BASE_URL
+                        else configured_seedance25_base_url
+                    ),
+                    placeholder=seedance25.DEFAULT_BASE_URL,
+                    key="seedance25_base_url_input",
+                )
+                _set_runtime_config(
+                    "app",
+                    "seedance25_base_url",
+                    seedance25_base_url.strip() or seedance25.DEFAULT_BASE_URL,
+                )
+
+                st.divider()
                 wavespeed_api_key = _get_material_api_keys("wavespeed_api_keys")
                 st.markdown("**WaveSpeed**")
                 wavespeed_api_key = st.text_input(
@@ -5188,6 +5248,7 @@ def _render_video_settings(panel, params):
                 "coverr": tr("Coverr"),
                 "wavespeed": tr("WaveSpeed AI Video"),
                 "volcengine_seedance": tr("Volcano Engine Seedance"),
+                "seedance25": tr("Volcano Engine Seedance 2.5"),
                 "ofox": tr("OFox AI Video"),
                 "metaso_minimax": tr("Metaso MiniMax H3"),
                 "muapi": tr("MuAPI AI Video"),
@@ -5508,6 +5569,8 @@ def _render_video_settings(panel, params):
                 _render_wavespeed_video_settings(params)
             if params.video_source == "volcengine_seedance":
                 _render_seedance_video_settings(params)
+            if params.video_source == "seedance25":
+                _render_seedance25_video_settings(params)
             if params.video_source == "ofox":
                 _render_ofox_video_settings(params)
             if params.video_source == "metaso_minimax":
@@ -5572,6 +5635,45 @@ def _render_seedance_video_settings(params):
         tr("Confirm Volcano Engine Seedance Charge"),
         key="volcengine_seedance_confirm_charge",
         help=tr("Confirm Volcano Engine Seedance Charge Help"),
+    )
+
+
+def _render_seedance25_video_settings(params):
+    """展示预计付费任务数量，并要求用户明确确认 Seedance 2.5 生成费用。"""
+    clip_duration = max(int(params.video_clip_duration or 1), 1)
+    video_count = max(int(params.video_count or 1), 1)
+    estimated_range = _estimate_voiceover_duration_range(
+        str(params.video_script or ""), params.voice_rate
+    )
+    if estimated_range:
+        min_clips = max(math.ceil(estimated_range[0] * video_count / clip_duration), 1)
+        max_clips = max(
+            math.ceil(estimated_range[1] * video_count / clip_duration), min_clips
+        )
+        st.warning(
+            tr("Volcano Engine Seedance 2.5 Billing Notice").format(
+                min=min_clips,
+                max=max_clips,
+                resolution=str(
+                    config.app.get(
+                        "seedance25_resolution", seedance25.DEFAULT_RESOLUTION
+                    )
+                    or seedance25.DEFAULT_RESOLUTION
+                ),
+            )
+        )
+    else:
+        st.warning(
+            tr("Volcano Engine Seedance 2.5 Billing Notice Without Script")
+        )
+    # 原生音频与图生视频是 2.5 相对 1.0 的主要差别，在提交前明确告知当前设置，
+    # 避免用户以为费用只按无声视频计算。
+    if config.app.get("seedance25_generate_audio", True):
+        st.caption(tr("Volcano Engine Seedance 2.5 Generate Audio Help"))
+    st.checkbox(
+        tr("Confirm Volcano Engine Seedance 2.5 Charge"),
+        key="seedance25_confirm_charge",
+        help=tr("Confirm Volcano Engine Seedance 2.5 Charge Help"),
     )
 
 
@@ -8099,6 +8201,22 @@ def _render_generation_controls(
         ):
             _remove_active_generation_task(task_id)
             st.error(tr("Confirm OFox Charge Required"))
+            st.stop()
+
+        if params.video_source == "seedance25" and not (
+            seedance25.is_enabled(
+                config.snapshot_config_with_pending(config.app)
+            )
+        ):
+            _remove_active_generation_task(task_id)
+            st.error(tr("Please Enter the Volcano Engine Ark API Key"))
+            st.stop()
+
+        if params.video_source == "seedance25" and not st.session_state.get(
+            "seedance25_confirm_charge", False
+        ):
+            _remove_active_generation_task(task_id)
+            st.error(tr("Confirm Volcano Engine Seedance 2.5 Charge Required"))
             st.stop()
 
         if params.video_source == "metaso_minimax" and not (
