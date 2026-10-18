@@ -18,6 +18,7 @@ from typing import Callable, List
 from loguru import logger
 import numpy as np
 from moviepy import (
+    AudioClip,
     AudioFileClip,
     ColorClip,
     CompositeAudioClip,
@@ -75,6 +76,11 @@ audio_codec = "aac"
 # Docker 里的 ffmpeg/AAC 组合在默认配置下更容易出现音频质量波动，
 # 这里显式抬高音频码率，避免成片阶段因为默认值过低而引入明显失真。
 audio_bitrate = "192k"
+# 原生音轨叠加：中间片段与拼接阶段统一用 aac/48k 立体声，保证 -f concat
+# 看到的每一段输入流结构一致（否则拼接会失败或错位）。
+_NATIVE_AUDIO_CODEC = "aac"
+_NATIVE_AUDIO_SAMPLE_RATE = 48000
+_NATIVE_AUDIO_CHANNELS = 2
 fps = 30
 # FFmpeg 按帧率拼接/转码时，最终时长可能比 MoviePy 读到的理论时长短几十毫秒。
 # 这里给视频素材多留一个很小的安全余量，避免音频末尾因为帧舍入出现黑屏、
@@ -628,6 +634,7 @@ def concat_video_clips_with_ffmpeg(
     threads: int,
     output_dir: str,
     max_duration: float | None = None,
+    include_audio: bool = False,
 ):
     # Separate renders may share a directory. Each FFmpeg process must keep its
     # own manifest until all codec attempts finish, without overwriting or
@@ -667,7 +674,21 @@ def concat_video_clips_with_ffmpeg(
             "-pix_fmt",
             "yuv420p",
         ]
+        if include_audio:
+            # 原生音轨模式下，每个中间片段都已被写成 aac/48k 立体声，
+            # 这里显式重编码成同一规格，保证 concat 输出一条干净的立体声音轨。
+            command.extend(
+                [
+                    "-c:a",
+                    _NATIVE_AUDIO_CODEC,
+                    "-ar",
+                    str(_NATIVE_AUDIO_SAMPLE_RATE),
+                    "-ac",
+                    str(_NATIVE_AUDIO_CHANNELS),
+                ]
+            )
         if max_duration is not None and max_duration > 0:
+            # -t 同时截断视频与音频两路流，因此原生音轨天然不会超过旁白时长。
             command.extend(["-t", f"{max_duration:.3f}"])
         command.append(staged_output)
         return command
@@ -819,7 +840,6 @@ def _open_video_clip_quietly(video_path: str, audio: bool = False) -> VideoFileC
 def close_clip(clip):
     if clip is None:
         return
-        
     try:
         # close main resources
         if hasattr(clip, 'reader') and clip.reader is not None:
@@ -852,6 +872,61 @@ def close_clip(clip):
     
     del clip
     gc.collect()
+
+def _silent_audio_clip(duration: float) -> AudioClip:
+    """生成一段与片段等长的静音音轨。
+
+    原生音轨模式下，即使某个素材源本身没有音轨也必须补一条静音轨：ffmpeg 的
+    ``-f concat`` 要求所有输入的流结构一致，混有"带音轨"和"无音轨"的片段会
+    拼接失败或产出错位。补静音让下游可以无条件按带音轨处理。
+    """
+    safe_duration = max(float(duration or 0.0), 0.0)
+    return AudioClip(
+        lambda t: np.zeros((1, _NATIVE_AUDIO_CHANNELS), dtype=np.float32),
+        duration=safe_duration,
+        fps=_NATIVE_AUDIO_SAMPLE_RATE,
+    )
+
+
+def _build_native_audio_segment(
+    *,
+    source_path: str,
+    start_time: float,
+    end_time: float,
+    speed: float,
+    target_duration: float,
+) -> AudioClip | None:
+    """按与视频完全相同的时间变换构造素材原声片段。
+
+    刻意不复用 ``clip.audio``：MoviePy 的几何/变速/转场效果是否保留音轨依赖
+    实现细节，不可依赖。这里用同一组参数（源时间窗、倍速、目标时长）独立构造
+    音频片段，再把两者一起 mux 进同一个中间文件，音视频因此在片段成型时就已
+    对齐，后续拼接与最终混音都不需要再计算时间轴。
+
+    源素材没有音轨时返回 ``None``，由调用方决定是否补静音。
+
+    返回的 AudioClip 持有自己的 ffmpeg reader，**调用方必须负责关闭**，否则
+    Windows 上临时片段文件会因句柄未释放而无法删除。
+    """
+    # 先只读元数据探测是否存在音轨，避免为无音轨素材白白启动一个音频 reader。
+    probe = _open_video_clip_quietly(source_path)
+    try:
+        has_audio = probe.audio is not None
+    finally:
+        close_clip(probe)
+    if not has_audio:
+        return None
+
+    audio = AudioFileClip(source_path)
+    try:
+        segment = audio.subclipped(start_time, end_time)
+        if speed != 1.0:
+            segment = segment.with_speed_scaled(speed)
+        return segment.subclipped(0, max(float(target_duration or 0.0), 0.0))
+    except Exception:
+        close_clip(audio)
+        raise
+
 
 def delete_files(files: List[str] | str):
     if isinstance(files, str):
@@ -977,6 +1052,7 @@ def combine_videos(
     source_groups: dict[str, str] | None = None,
     used_video_paths: List[str] | None = None,
     progress_callback: Callable[[float], None] | None = None,
+    native_audio_enabled: bool = False,
 ) -> str:
     # Pydantic leaves this optional default as the string "random" unless
     # explicitly provided. Normalize it once for all downstream enum access.
@@ -1081,12 +1157,19 @@ def combine_videos(
         source_clip = None
         clip = None
         clip_file = None
+        native_audio = None
         try:
             logger.debug(
                 f"processing clip {index + 1}: {subclipped_item.width}x{subclipped_item.height}, "
                 f"source: {os.path.basename(subclipped_item.source_file_path)}"
             )
-            source_clip = _open_video_clip_quietly(subclipped_item.file_path)
+            source_clip = (
+                _open_video_clip_quietly(
+                    subclipped_item.file_path, audio=True
+                )
+                if native_audio_enabled
+                else _open_video_clip_quietly(subclipped_item.file_path)
+            )
             clip = source_clip.subclipped(
                 subclipped_item.start_time, subclipped_item.end_time
             )
@@ -1146,6 +1229,26 @@ def combine_videos(
             if clip.duration > max_clip_duration:
                 clip = clip.subclipped(0, max_clip_duration)
 
+            # 原生音轨在片段成型时就开始对齐：用与视频相同的源时间窗和倍速构造
+            # 音频子片段，再与视频一起写进同一个中间文件。这样后续拼接无需再算
+            # 时间轴；转场是纯视频效果，不改变片段时长，因此不影响对齐。
+            if native_audio_enabled:
+                native_audio = _build_native_audio_segment(
+                    source_path=subclipped_item.file_path,
+                    start_time=subclipped_item.start_time,
+                    end_time=subclipped_item.end_time,
+                    speed=normalized_clip_speed,
+                    target_duration=clip.duration,
+                )
+                # 无音轨素材必须补静音：concat 要求所有输入的流结构一致，
+                # 混有带/不带音轨的片段会让拼接失败或产出错位。
+                audio_for_mux = (
+                    native_audio
+                    if native_audio is not None
+                    else _silent_audio_clip(clip.duration)
+                )
+                clip = clip.with_audio(audio_for_mux)
+
             # Write each candidate clip to a unique temporary file. Threads must not
             # share the same output path.
             # Distinct combinations can share a task/output directory. Reserve
@@ -1154,12 +1257,18 @@ def combine_videos(
                 dir=output_dir or ".", prefix="temp-clip-", suffix=".mp4", delete=False
             ) as temporary_clip:
                 clip_file = temporary_clip.name
+            write_kwargs = {}
+            if native_audio_enabled:
+                # 中间片段统一 aac/48k 立体声，保证 concat 看到一致的流结构。
+                write_kwargs["audio_codec"] = _NATIVE_AUDIO_CODEC
+                write_kwargs["audio_fps"] = _NATIVE_AUDIO_SAMPLE_RATE
             _write_videofile_with_codec_fallback(
                 clip,
                 clip_file,
                 codec=_get_configured_video_codec(),
                 logger=None,
                 fps=fps,
+                **write_kwargs,
             )
 
             clip_duration_saved = clip.duration
@@ -1179,6 +1288,9 @@ def combine_videos(
             # The derived clip shares its FFmpeg reader with the source. If
             # subclipping itself failed, close the original source instead.
             close_clip(clip if clip is not None else source_clip)
+            # 原生音轨持有自己的 ffmpeg reader；不在这里关闭会让 Windows 上的
+            # 临时片段文件保持被占用，combine_videos 的清理就会失败。
+            close_clip(native_audio)
             # MoviePy may leave a truncated MP4 even when encoding raises. It
             # was never returned, so concat cleanup cannot see it.
             # Close the reader first so Windows can remove the partial file.
@@ -1267,6 +1379,7 @@ def combine_videos(
             threads=threads,
             output_dir=output_dir,
             max_duration=audio_duration,
+            include_audio=native_audio_enabled,
         )
         if used_video_paths is not None:
             # Exclude safety-margin clips that FFmpeg trims entirely from the output.
@@ -1478,6 +1591,24 @@ def _get_visible_center_position(
         logger.debug(f"failed to center subtitle text by visible mask: {str(exc)}")
 
     return x, y
+
+
+def validate_native_audio(params: VideoParams) -> None:
+    """在开始渲染前拒绝非法的原生音轨音量。
+
+    原生音轨是叠加到旁白之上的背景层，音量必须是有限的非负数；负值会让声音
+    反相，NaN/Infinity 会污染整条混音链并且很难从成片里定位原因。
+    """
+    if not getattr(params, "native_audio_enabled", False):
+        return
+    volume = params.native_audio_volume
+    if volume is None:
+        return
+    value = float(volume)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(
+            "native_audio_volume must be a finite non-negative number"
+        )
 
 
 def validate_subtitle_colors(params: VideoParams) -> None:
@@ -1781,14 +1912,36 @@ def generate_video(
     # ExitStack 显式持有所有原始文件 reader，确保成功、字幕异常、混音失败和
     # 视频写入失败等路径都能释放 FFmpeg 子进程，尤其避免 Windows 文件被占用。
     with ExitStack() as clip_stack:
+        # 原生音轨模式下必须让 VideoFileClip 读取音轨，否则下面的混音层拿不到声音。
+        native_audio_enabled = bool(getattr(params, "native_audio_enabled", False))
+        # 默认路径保持原有的调用形态（不传 audio 关键字），只有确实需要原生
+        # 音轨时才要求 MoviePy 读取音轨——这也让既有调用方与测试替身无需改动。
         source_video_clip = clip_stack.enter_context(
-            _open_video_clip_quietly(video_path)
+            _open_video_clip_quietly(video_path, audio=True)
+            if native_audio_enabled
+            else _open_video_clip_quietly(video_path)
         )
         voice_source_clip = clip_stack.enter_context(AudioFileClip(audio_path))
         video_clip = source_video_clip
         audio_clip = voice_source_clip.with_effects(
             [afx.MultiplyVolume(1.0 if params.voice_volume is None else params.voice_volume)]
         )
+
+        # 原生音轨作为**背景层**与旁白叠加，而不是替换旁白：旁白仍是主声道，
+        # 原生音轨（环境声/对白/音效）按 native_audio_volume 压低后混入。
+        # 这些音轨在 combine_videos 阶段就已被写入片段文件并与画面同步，
+        # 因此这里直接取合成视频的音轨即可，无需重算时间轴。
+        native_audio_layer = None
+        if native_audio_enabled and source_video_clip.audio is not None:
+            native_volume = params.native_audio_volume
+            native_audio_layer = source_video_clip.audio.with_effects(
+                [
+                    afx.MultiplyVolume(
+                        0.3 if native_volume is None else float(native_volume)
+                    )
+                ]
+            )
+            audio_clip = CompositeAudioClip([audio_clip, native_audio_layer])
 
         def make_textclip(text):
             return TextClip(

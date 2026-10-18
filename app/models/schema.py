@@ -136,6 +136,14 @@ class VideoParams(BaseModel):
     video_music_prompt: str = Field(default="", max_length=2000)
     sonilo_bgm_prompt: str = Field(default="", max_length=2000)
 
+    # 原生音轨叠加：部分 AI 素材源（如 Seedance 2.5）能生成自带声音的视频。
+    # 默认关闭，成片音频仍只由 TTS 旁白与 BGM 组成，与既有行为逐字节一致。
+    # 开启后原生音轨作为背景层与旁白叠加混音，而不是替换旁白。
+    native_audio_enabled: Optional[bool] = False
+    native_audio_volume: Optional[float] = Field(
+        default=0.3, allow_inf_nan=False
+    )
+
     subtitle_enabled: Optional[bool] = True
     subtitle_position: Optional[str] = config.ui.get(
         "subtitle_position", "bottom"

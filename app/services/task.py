@@ -988,6 +988,10 @@ def generate_final_videos(
             max_clip_duration=params.video_clip_duration,
             threads=params.n_threads,
             clip_speed=params.video_clip_speed,
+            # 原生音轨必须在片段拼接阶段就写进中间文件，最终混音才有声音可用。
+            native_audio_enabled=bool(
+                getattr(params, "native_audio_enabled", False)
+            ),
             progress_callback=_stage_progress_reporter(
                 task_id, _progress, _progress + combine_share
             ),
@@ -1478,6 +1482,13 @@ def _run_pipeline(
             video.validate_subtitle_colors(params)
         except ValueError as exc:
             return _mark_task_failed(task_id, "preflight", str(exc))
+
+    # 原生音轨音量非法会在混音阶段污染整条音频链，且很难从成片反查，
+    # 因此在任何生成服务开始消耗额度之前就拒绝。
+    try:
+        video.validate_native_audio(params)
+    except ValueError as exc:
+        return _mark_task_failed(task_id, "preflight", str(exc))
 
     if stop_at in {"materials", "video"} and params.video_source not in _SUPPORTED_VIDEO_SOURCES:
         return _mark_task_failed(
