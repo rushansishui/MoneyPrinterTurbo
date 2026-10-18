@@ -585,3 +585,61 @@ class VideoMaterialUploadResponse(BaseResponse):
             },
         }
     )
+
+
+# ---- Standalone AI video generation ----
+class FirstFrameInput(BaseModel):
+    """图生视频的首帧描述。
+
+    ``kind`` 取 ``url`` / ``local_path`` / ``asset_id``；``origin`` 仅用于审计，
+    标记这张图来自本地上传、文生图产出还是库存图库。
+    """
+
+    kind: Literal["url", "local_path", "asset_id"]
+    value: str = Field(min_length=1)
+    mime: str = ""
+    origin: Literal["upload", "generated", "stock"] = "upload"
+
+
+class AIVideoGenerateRequest(BaseModel):
+    provider: str = Field(min_length=1)
+    prompt: str = Field(min_length=1, max_length=7000)
+    duration: int = Field(default=5, ge=1, le=60)
+    video_aspect: VideoAspect = VideoAspect.portrait
+    first_frame: Optional[FirstFrameInput] = None
+    # API 没有会话可以承载 WebUI 那样的确认框，因此计费确认必须显式入参。
+    confirm_charge: bool = False
+
+
+class GeneratedClipData(BaseModel):
+    provider: str
+    file: str
+    duration: int
+    width: int
+    height: int
+    remote_task_id: str = ""
+
+
+class AIVideoGenerateData(BaseModel):
+    clips: List[GeneratedClipData]
+
+
+class AIVideoProviderData(BaseModel):
+    provider_id: str
+    label: str
+    supports_image_to_video: bool
+    supports_native_audio: bool
+    requires_charge_confirmation: bool
+    enabled: bool
+
+
+class AIVideoProvidersData(BaseModel):
+    providers: List[AIVideoProviderData]
+
+
+class AIVideoGenerateResponse(BaseResponse):
+    data: AIVideoGenerateData
+
+
+class AIVideoProvidersResponse(BaseResponse):
+    data: AIVideoProvidersData

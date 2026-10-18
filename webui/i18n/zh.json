@@ -611,6 +611,26 @@
     "Confirm Volcano Engine Seedance 2.5 Charge Required": "请先确认火山引擎 Seedance 2.5 的生成费用，再开始生成视频。",
     "Volcano Engine Seedance 2.5 Help": "通过火山引擎方舟官方 Seedance 2.5 API 按脚本关键词生成全新视频素材。支持 4-30 秒片段、4k 分辨率、首帧图生视频与原生音频生成；每段素材都是一个付费任务。",
     "Volcano Engine Seedance API Key": "火山引擎方舟 API Key",
-    "Volcano Engine Seedance API Key Help": "留空时会复用 VOLCENGINE_ARK_API_KEY，或 LLM 设置里的共享 volcengine_api_key。"
+    "Volcano Engine Seedance API Key Help": "留空时会复用 VOLCENGINE_ARK_API_KEY，或 LLM 设置里的共享 volcengine_api_key。",
+    "AI Video Studio": "AI 文生视频",
+    "AI Video Studio Help": "直接用 AI 视频模型根据提示词生成一段视频。该入口不经过配音、字幕与剪辑流水线，产出的是原始生成片段，而不是完整成片。",
+    "AI Video Provider": "AI 视频服务",
+    "AI Video Prompt": "提示词",
+    "AI Video Prompt Help": "描述镜头内容：主体、动作、运镜方式与风格。描述越具体，片段越可用。",
+    "AI Video Duration": "片段时长（秒）",
+    "First Frame Image": "首帧图片",
+    "First Frame Image Help": "可选。提供后模型会以该图为起点生成视频，而不是仅从提示词开始。",
+    "First Frame Image Upload": "上传图片",
+    "First Frame Image URL": "或填写公开可访问的图片地址",
+    "No AI Video Provider Available": "没有可用的 AI 视频服务，请检查配置。",
+    "AI Video Studio Billing Notice": "每次生成都会在服务商侧创建一个付费任务，请确认了解费用后再生成。",
+    "Confirm AI Video Studio Charge": "我已了解本次生成会产生费用",
+    "Confirm AI Video Studio Charge Required": "请先确认生成费用。",
+    "Please Enter the AI Video Prompt": "请输入提示词。",
+    "Generate AI Video": "生成",
+    "Generating AI Video": "正在生成片段…",
+    "AI Video Generation Complete": "片段已生成。",
+    "Square": "方形",
+    "API Key Required": "需要 API Key"
   }
 }

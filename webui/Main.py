@@ -65,6 +65,7 @@ from app.services import sonilo as sonilo_service
 from app.services import state as sm
 from app.services import task as tm
 from app.services import version_checker
+from app.services import ai_video_studio as ai_video_studio_service
 # Seedance 2.5 是本轮新增的源，没有历史模块路径，直接从 provider 包导入。
 from app.services.video_providers.sources import seedance25
 from app.utils.logging_utils import configure_terminal_logger
@@ -1723,6 +1724,166 @@ def _open_material_settings_dialog():
     _open_settings_dialog("material")
 
 
+def _open_ai_video_studio():
+    """打开独立文生视频弹窗。"""
+    st.session_state["ai_video_studio_open"] = True
+
+
+def _dismiss_ai_video_studio():
+    st.session_state.pop("ai_video_studio_open", None)
+
+
+@st.dialog(
+    tr("AI Video Studio"),
+    width="large",
+    on_dismiss=_dismiss_ai_video_studio,
+)
+def _render_ai_video_studio_dialog():
+    """给一个提示词直接用 AI 模型生成一段视频，不走配音/字幕流水线。
+
+    该入口与主生成表单完全独立：它不产生任务记录，产物落到素材缓存目录，
+    适合先快速验证提示词效果，或单独产出素材。
+    """
+    st.caption(tr("AI Video Studio Help"))
+
+    providers = ai_video_studio_service.list_providers()
+    if not providers:
+        st.warning(tr("No AI Video Provider Available"))
+        return
+
+    enabled_providers = [item for item in providers if item["enabled"]]
+    options = enabled_providers or providers
+    labels = {
+        item["provider_id"]: (
+            f"{item['label']}"
+            + ("" if item["enabled"] else f" ({tr('API Key Required')})")
+        )
+        for item in options
+    }
+    provider_id = st.selectbox(
+        tr("AI Video Provider"),
+        options=[item["provider_id"] for item in options],
+        format_func=lambda value: labels.get(value, value),
+        key="ai_video_studio_provider",
+    )
+    selected = next(item for item in options if item["provider_id"] == provider_id)
+
+    prompt = st.text_area(
+        tr("AI Video Prompt"),
+        key="ai_video_studio_prompt",
+        height=120,
+        help=tr("AI Video Prompt Help"),
+    )
+    duration = st.number_input(
+        tr("AI Video Duration"),
+        min_value=1,
+        max_value=60,
+        value=5,
+        step=1,
+        key="ai_video_studio_duration",
+    )
+    aspect_label = st.selectbox(
+        tr("Video Ratio"),
+        options=[
+            tr("Portrait"),
+            tr("Landscape"),
+            tr("Square"),
+        ],
+        key="ai_video_studio_aspect",
+    )
+    aspect = {
+        tr("Portrait"): "9:16",
+        tr("Landscape"): "16:9",
+        tr("Square"): "1:1",
+    }[aspect_label]
+
+    first_frame = None
+    if selected["supports_image_to_video"]:
+        with st.expander(tr("First Frame Image"), expanded=False):
+            st.caption(tr("First Frame Image Help"))
+            uploaded_image = st.file_uploader(
+                tr("First Frame Image Upload"),
+                type=["png", "jpg", "jpeg", "bmp", "webp"],
+                key="ai_video_studio_first_frame_upload",
+            )
+            first_frame_url = st.text_input(
+                tr("First Frame Image URL"),
+                key="ai_video_studio_first_frame_url",
+            )
+        if uploaded_image is not None:
+            # 上传的图片先落盘，再以本地路径形式交给 provider 编码成 base64。
+            staged_dir = utils.storage_dir("ai_video_first_frames", create=True)
+            suffix = os.path.splitext(uploaded_image.name)[1] or ".png"
+            staged_path = os.path.join(staged_dir, f"{utils.get_uuid()}{suffix}")
+            with open(staged_path, "wb") as handle:
+                handle.write(uploaded_image.getbuffer())
+            first_frame = {
+                "kind": "local_path",
+                "value": staged_path,
+                "origin": "upload",
+            }
+        elif str(first_frame_url or "").strip():
+            first_frame = {
+                "kind": "url",
+                "value": str(first_frame_url).strip(),
+                "origin": "stock",
+            }
+
+    st.warning(tr("AI Video Studio Billing Notice"))
+    confirm_charge = st.checkbox(
+        tr("Confirm AI Video Studio Charge"),
+        key="ai_video_studio_confirm_charge",
+    )
+
+    if st.button(
+        tr("Generate AI Video"),
+        key="ai_video_studio_generate",
+        type="primary",
+        use_container_width=True,
+    ):
+        if not str(prompt or "").strip():
+            st.error(tr("Please Enter the AI Video Prompt"))
+            return
+        if selected["requires_charge_confirmation"] and not confirm_charge:
+            st.error(tr("Confirm AI Video Studio Charge Required"))
+            return
+        try:
+            with st.spinner(tr("Generating AI Video")):
+                clips = ai_video_studio_service.generate_and_save(
+                    provider_id=provider_id,
+                    prompt=prompt,
+                    duration=int(duration),
+                    video_aspect=aspect,
+                    first_frame=first_frame,
+                    confirm_charge=bool(confirm_charge),
+                )
+        except ai_video_studio_service.AIVideoStudioError as exc:
+            st.error(str(exc))
+            return
+        except ai_video_studio_service.AIVideoGenerationError as exc:
+            message = str(exc)
+            if exc.task_id:
+                message = f"{message} (remote_id={exc.task_id})"
+            st.error(message)
+            return
+        except Exception as exc:
+            logger.exception(f"ai video studio generation failed: {exc}")
+            st.error(f"{type(exc).__name__}: {exc}")
+            return
+
+        st.session_state["ai_video_studio_results"] = [
+            clip.file_path for clip in clips
+        ]
+        st.success(tr("AI Video Generation Complete"))
+
+    result_paths = st.session_state.get("ai_video_studio_results") or []
+    for index, path in enumerate(result_paths):
+        if not os.path.isfile(path):
+            continue
+        st.video(path, key=f"ai_video_studio_result_{index}")
+        st.caption(path)
+
+
 def _render_brand(available_update: str | None = None):
     """渲染项目名称、当前版本和可选的更新入口。"""
     update_link = ""
@@ -1795,6 +1956,15 @@ def _render_top_bar():
             width="stretch",
         ):
             _render_task_manager_entry()
+
+            st.button(
+                tr("AI Video Studio"),
+                key="open_ai_video_studio_button",
+                type="secondary",
+                icon=":material/movie:",
+                width="content",
+                on_click=_open_ai_video_studio,
+            )
 
             st.button(
                 tr("Settings"),
@@ -8491,6 +8661,9 @@ def _render_application():
 
     if st.session_state.get("settings_dialog_open", False):
         _render_settings_dialog()
+
+    if st.session_state.get("ai_video_studio_open", False):
+        _render_ai_video_studio_dialog()
 
     if _apply_pending_settings_preset():
         st.success(tr("Settings Preset Imported"))
