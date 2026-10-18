@@ -33,6 +33,7 @@ SUPPORTED_SOURCES = {
     "coverr",
     "wavespeed",
     "volcengine_seedance",
+    "seedance25",
     "ofox",
     "metaso_minimax",
     "muapi",

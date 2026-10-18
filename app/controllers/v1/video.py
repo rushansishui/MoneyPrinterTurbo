@@ -249,6 +249,9 @@ def create_task(
             file_security.resolve_path_within_directory(
                 utils.font_dir(), body.font_name or "STHeitiMedium.ttc"
             )
+        if stop_at == "video" and isinstance(body, TaskVideoRequest):
+            # 原生音轨音量非法时在提交阶段就返回 400，而不是等渲染到混音段。
+            tm.video.validate_native_audio(body)
         task = {
             "task_id": task_id,
             "request_id": request_id,

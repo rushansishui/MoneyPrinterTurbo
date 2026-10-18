@@ -43,6 +43,7 @@ _CLI_VIDEO_SOURCES = (
     "coverr",
     "wavespeed",
     "volcengine_seedance",
+    "seedance25",
     "ofox",
     "metaso_minimax",
     "muapi",
@@ -376,6 +377,14 @@ Batch manifests:
         help=(
             "confirm that Volcano Engine Seedance creates paid Ark tasks; required "
             "with --video-source volcengine_seedance for materials or video output"
+        ),
+    )
+    material_group.add_argument(
+        "--confirm-seedance25-charge",
+        action="store_true",
+        help=(
+            "confirm that Volcano Engine Seedance 2.5 creates paid Ark tasks; "
+            "required with --video-source seedance25 for materials or video output"
         ),
     )
     material_group.add_argument(
@@ -746,6 +755,16 @@ Batch manifests:
         parser.error(
             "--confirm-seedance-charge is required with "
             "--video-source volcengine_seedance"
+        )
+    if (
+        not args.batch_file
+        and args.video_source == "seedance25"
+        and stage_requires_materials
+        and not args.confirm_seedance25_charge
+    ):
+        parser.error(
+            "--confirm-seedance25-charge is required with "
+            "--video-source seedance25"
         )
     if (
         not args.batch_file
@@ -1174,6 +1193,7 @@ def _validate_batch_task_params(
     custom_position_is_explicit: bool,
     wavespeed_charge_confirmed: bool,
     seedance_charge_confirmed: bool,
+    seedance25_charge_confirmed: bool,
     ofox_charge_confirmed: bool,
     metaso_minimax_charge_confirmed: bool,
     muapi_charge_confirmed: bool,
@@ -1224,6 +1244,15 @@ def _validate_batch_task_params(
     ):
         raise ValueError(
             "--confirm-seedance-charge is required for Volcano Engine Seedance"
+        )
+    if (
+        params.video_source == "seedance25"
+        and stop_at in {"materials", "video"}
+        and not seedance25_charge_confirmed
+    ):
+        raise ValueError(
+            "--confirm-seedance25-charge is required for "
+            "Volcano Engine Seedance 2.5"
         )
     if (
         params.video_source == "ofox"
@@ -1353,6 +1382,7 @@ def _build_batch_tasks(args: argparse.Namespace) -> list[VideoParams]:
                     or "custom_position" in override_fields
                 ),
                 seedance_charge_confirmed=args.confirm_seedance_charge,
+                seedance25_charge_confirmed=args.confirm_seedance25_charge,
                 wavespeed_charge_confirmed=args.confirm_wavespeed_charge,
                 ofox_charge_confirmed=args.confirm_ofox_charge,
                 metaso_minimax_charge_confirmed=(

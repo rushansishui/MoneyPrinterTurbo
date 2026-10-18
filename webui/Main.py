@@ -65,6 +65,9 @@ from app.services import sonilo as sonilo_service
 from app.services import state as sm
 from app.services import task as tm
 from app.services import version_checker
+from app.services import ai_video_studio as ai_video_studio_service
+# Seedance 2.5 是本轮新增的源，没有历史模块路径，直接从 provider 包导入。
+from app.services.video_providers.sources import seedance25
 from app.utils.logging_utils import configure_terminal_logger
 from app.utils import utils
 
@@ -132,6 +135,7 @@ VIDEO_SOURCE_GROUPS = {
         "ofox",
         "loomloom",
         "volcengine_seedance",
+        "seedance25",
         "wavespeed",
         "muapi",
     ),
@@ -751,6 +755,7 @@ def _initialize_session_state():
         "loomloom_video_scene_autofill_digest": "",
         "wavespeed_confirm_charge": False,
         "volcengine_seedance_confirm_charge": False,
+        "seedance25_confirm_charge": False,
         "ofox_confirm_charge": False,
         "metaso_minimax_confirm_charge": False,
         "muapi_confirm_charge": False,
@@ -1719,6 +1724,166 @@ def _open_material_settings_dialog():
     _open_settings_dialog("material")
 
 
+def _open_ai_video_studio():
+    """打开独立文生视频弹窗。"""
+    st.session_state["ai_video_studio_open"] = True
+
+
+def _dismiss_ai_video_studio():
+    st.session_state.pop("ai_video_studio_open", None)
+
+
+@st.dialog(
+    tr("AI Video Studio"),
+    width="large",
+    on_dismiss=_dismiss_ai_video_studio,
+)
+def _render_ai_video_studio_dialog():
+    """给一个提示词直接用 AI 模型生成一段视频，不走配音/字幕流水线。
+
+    该入口与主生成表单完全独立：它不产生任务记录，产物落到素材缓存目录，
+    适合先快速验证提示词效果，或单独产出素材。
+    """
+    st.caption(tr("AI Video Studio Help"))
+
+    providers = ai_video_studio_service.list_providers()
+    if not providers:
+        st.warning(tr("No AI Video Provider Available"))
+        return
+
+    enabled_providers = [item for item in providers if item["enabled"]]
+    options = enabled_providers or providers
+    labels = {
+        item["provider_id"]: (
+            f"{item['label']}"
+            + ("" if item["enabled"] else f" ({tr('API Key Required')})")
+        )
+        for item in options
+    }
+    provider_id = st.selectbox(
+        tr("AI Video Provider"),
+        options=[item["provider_id"] for item in options],
+        format_func=lambda value: labels.get(value, value),
+        key="ai_video_studio_provider",
+    )
+    selected = next(item for item in options if item["provider_id"] == provider_id)
+
+    prompt = st.text_area(
+        tr("AI Video Prompt"),
+        key="ai_video_studio_prompt",
+        height=120,
+        help=tr("AI Video Prompt Help"),
+    )
+    duration = st.number_input(
+        tr("AI Video Duration"),
+        min_value=1,
+        max_value=60,
+        value=5,
+        step=1,
+        key="ai_video_studio_duration",
+    )
+    aspect_label = st.selectbox(
+        tr("Video Ratio"),
+        options=[
+            tr("Portrait"),
+            tr("Landscape"),
+            tr("Square"),
+        ],
+        key="ai_video_studio_aspect",
+    )
+    aspect = {
+        tr("Portrait"): "9:16",
+        tr("Landscape"): "16:9",
+        tr("Square"): "1:1",
+    }[aspect_label]
+
+    first_frame = None
+    if selected["supports_image_to_video"]:
+        with st.expander(tr("First Frame Image"), expanded=False):
+            st.caption(tr("First Frame Image Help"))
+            uploaded_image = st.file_uploader(
+                tr("First Frame Image Upload"),
+                type=["png", "jpg", "jpeg", "bmp", "webp"],
+                key="ai_video_studio_first_frame_upload",
+            )
+            first_frame_url = st.text_input(
+                tr("First Frame Image URL"),
+                key="ai_video_studio_first_frame_url",
+            )
+        if uploaded_image is not None:
+            # 上传的图片先落盘，再以本地路径形式交给 provider 编码成 base64。
+            staged_dir = utils.storage_dir("ai_video_first_frames", create=True)
+            suffix = os.path.splitext(uploaded_image.name)[1] or ".png"
+            staged_path = os.path.join(staged_dir, f"{utils.get_uuid()}{suffix}")
+            with open(staged_path, "wb") as handle:
+                handle.write(uploaded_image.getbuffer())
+            first_frame = {
+                "kind": "local_path",
+                "value": staged_path,
+                "origin": "upload",
+            }
+        elif str(first_frame_url or "").strip():
+            first_frame = {
+                "kind": "url",
+                "value": str(first_frame_url).strip(),
+                "origin": "stock",
+            }
+
+    st.warning(tr("AI Video Studio Billing Notice"))
+    confirm_charge = st.checkbox(
+        tr("Confirm AI Video Studio Charge"),
+        key="ai_video_studio_confirm_charge",
+    )
+
+    if st.button(
+        tr("Generate AI Video"),
+        key="ai_video_studio_generate",
+        type="primary",
+        use_container_width=True,
+    ):
+        if not str(prompt or "").strip():
+            st.error(tr("Please Enter the AI Video Prompt"))
+            return
+        if selected["requires_charge_confirmation"] and not confirm_charge:
+            st.error(tr("Confirm AI Video Studio Charge Required"))
+            return
+        try:
+            with st.spinner(tr("Generating AI Video")):
+                clips = ai_video_studio_service.generate_and_save(
+                    provider_id=provider_id,
+                    prompt=prompt,
+                    duration=int(duration),
+                    video_aspect=aspect,
+                    first_frame=first_frame,
+                    confirm_charge=bool(confirm_charge),
+                )
+        except ai_video_studio_service.AIVideoStudioError as exc:
+            st.error(str(exc))
+            return
+        except ai_video_studio_service.AIVideoGenerationError as exc:
+            message = str(exc)
+            if exc.task_id:
+                message = f"{message} (remote_id={exc.task_id})"
+            st.error(message)
+            return
+        except Exception as exc:
+            logger.exception(f"ai video studio generation failed: {exc}")
+            st.error(f"{type(exc).__name__}: {exc}")
+            return
+
+        st.session_state["ai_video_studio_results"] = [
+            clip.file_path for clip in clips
+        ]
+        st.success(tr("AI Video Generation Complete"))
+
+    result_paths = st.session_state.get("ai_video_studio_results") or []
+    for index, path in enumerate(result_paths):
+        if not os.path.isfile(path):
+            continue
+        st.video(path, key=f"ai_video_studio_result_{index}")
+        st.caption(path)
+
+
 def _render_brand(available_update: str | None = None):
     """渲染项目名称、当前版本和可选的更新入口。"""
     update_link = ""
@@ -1791,6 +1956,15 @@ def _render_top_bar():
             width="stretch",
         ):
             _render_task_manager_entry()
+
+            st.button(
+                tr("AI Video Studio"),
+                key="open_ai_video_studio_button",
+                type="secondary",
+                icon=":material/movie:",
+                width="content",
+                on_click=_open_ai_video_studio,
+            )
 
             st.button(
                 tr("Settings"),
@@ -3927,6 +4101,62 @@ def _render_settings_dialog():
                 )
 
                 st.divider()
+                st.markdown(f"**{tr('Volcano Engine Seedance 2.5')}**")
+                st.caption(tr("Volcano Engine Seedance 2.5 Help"))
+                seedance25_api_key = st.text_input(
+                    tr("Volcano Engine Seedance API Key"),
+                    value=str(config.app.get("seedance25_api_key", "") or ""),
+                    type="password",
+                    help=tr("Volcano Engine Seedance API Key Help"),
+                    key="seedance25_api_key_input",
+                )
+                _set_runtime_config(
+                    "app", "seedance25_api_key", seedance25_api_key.strip()
+                )
+                configured_seedance25_model = str(
+                    config.app.get(
+                        "seedance25_model", seedance25.DEFAULT_MODEL_ID
+                    )
+                    or seedance25.DEFAULT_MODEL_ID
+                ).strip()
+                seedance25_model = st.text_input(
+                    tr("Volcano Engine Seedance Model"),
+                    value=(
+                        ""
+                        if configured_seedance25_model
+                        == seedance25.DEFAULT_MODEL_ID
+                        else configured_seedance25_model
+                    ),
+                    placeholder=seedance25.DEFAULT_MODEL_ID,
+                    key="seedance25_model_input",
+                )
+                _set_runtime_config(
+                    "app",
+                    "seedance25_model",
+                    seedance25_model.strip() or seedance25.DEFAULT_MODEL_ID,
+                )
+                configured_seedance25_base_url = str(
+                    config.app.get("seedance25_base_url", seedance25.DEFAULT_BASE_URL)
+                    or seedance25.DEFAULT_BASE_URL
+                ).strip()
+                seedance25_base_url = st.text_input(
+                    tr("Volcano Engine Ark Base URL"),
+                    value=(
+                        ""
+                        if configured_seedance25_base_url
+                        == seedance25.DEFAULT_BASE_URL
+                        else configured_seedance25_base_url
+                    ),
+                    placeholder=seedance25.DEFAULT_BASE_URL,
+                    key="seedance25_base_url_input",
+                )
+                _set_runtime_config(
+                    "app",
+                    "seedance25_base_url",
+                    seedance25_base_url.strip() or seedance25.DEFAULT_BASE_URL,
+                )
+
+                st.divider()
                 wavespeed_api_key = _get_material_api_keys("wavespeed_api_keys")
                 st.markdown("**WaveSpeed**")
                 wavespeed_api_key = st.text_input(
@@ -5188,6 +5418,7 @@ def _render_video_settings(panel, params):
                 "coverr": tr("Coverr"),
                 "wavespeed": tr("WaveSpeed AI Video"),
                 "volcengine_seedance": tr("Volcano Engine Seedance"),
+                "seedance25": tr("Volcano Engine Seedance 2.5"),
                 "ofox": tr("OFox AI Video"),
                 "metaso_minimax": tr("Metaso MiniMax H3"),
                 "muapi": tr("MuAPI AI Video"),
@@ -5508,6 +5739,8 @@ def _render_video_settings(panel, params):
                 _render_wavespeed_video_settings(params)
             if params.video_source == "volcengine_seedance":
                 _render_seedance_video_settings(params)
+            if params.video_source == "seedance25":
+                _render_seedance25_video_settings(params)
             if params.video_source == "ofox":
                 _render_ofox_video_settings(params)
             if params.video_source == "metaso_minimax":
@@ -5572,6 +5805,45 @@ def _render_seedance_video_settings(params):
         tr("Confirm Volcano Engine Seedance Charge"),
         key="volcengine_seedance_confirm_charge",
         help=tr("Confirm Volcano Engine Seedance Charge Help"),
+    )
+
+
+def _render_seedance25_video_settings(params):
+    """展示预计付费任务数量，并要求用户明确确认 Seedance 2.5 生成费用。"""
+    clip_duration = max(int(params.video_clip_duration or 1), 1)
+    video_count = max(int(params.video_count or 1), 1)
+    estimated_range = _estimate_voiceover_duration_range(
+        str(params.video_script or ""), params.voice_rate
+    )
+    if estimated_range:
+        min_clips = max(math.ceil(estimated_range[0] * video_count / clip_duration), 1)
+        max_clips = max(
+            math.ceil(estimated_range[1] * video_count / clip_duration), min_clips
+        )
+        st.warning(
+            tr("Volcano Engine Seedance 2.5 Billing Notice").format(
+                min=min_clips,
+                max=max_clips,
+                resolution=str(
+                    config.app.get(
+                        "seedance25_resolution", seedance25.DEFAULT_RESOLUTION
+                    )
+                    or seedance25.DEFAULT_RESOLUTION
+                ),
+            )
+        )
+    else:
+        st.warning(
+            tr("Volcano Engine Seedance 2.5 Billing Notice Without Script")
+        )
+    # 原生音频与图生视频是 2.5 相对 1.0 的主要差别，在提交前明确告知当前设置，
+    # 避免用户以为费用只按无声视频计算。
+    if config.app.get("seedance25_generate_audio", True):
+        st.caption(tr("Volcano Engine Seedance 2.5 Generate Audio Help"))
+    st.checkbox(
+        tr("Confirm Volcano Engine Seedance 2.5 Charge"),
+        key="seedance25_confirm_charge",
+        help=tr("Confirm Volcano Engine Seedance 2.5 Charge Help"),
     )
 
 
@@ -8101,6 +8373,22 @@ def _render_generation_controls(
             st.error(tr("Confirm OFox Charge Required"))
             st.stop()
 
+        if params.video_source == "seedance25" and not (
+            seedance25.is_enabled(
+                config.snapshot_config_with_pending(config.app)
+            )
+        ):
+            _remove_active_generation_task(task_id)
+            st.error(tr("Please Enter the Volcano Engine Ark API Key"))
+            st.stop()
+
+        if params.video_source == "seedance25" and not st.session_state.get(
+            "seedance25_confirm_charge", False
+        ):
+            _remove_active_generation_task(task_id)
+            st.error(tr("Confirm Volcano Engine Seedance 2.5 Charge Required"))
+            st.stop()
+
         if params.video_source == "metaso_minimax" and not (
             metaso_minimax.is_enabled(
                 config.snapshot_config_with_pending(config.app)
@@ -8373,6 +8661,9 @@ def _render_application():
 
     if st.session_state.get("settings_dialog_open", False):
         _render_settings_dialog()
+
+    if st.session_state.get("ai_video_studio_open", False):
+        _render_ai_video_studio_dialog()
 
     if _apply_pending_settings_preset():
         st.success(tr("Settings Preset Imported"))

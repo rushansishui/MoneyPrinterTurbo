@@ -22,19 +22,16 @@ from app.services import (
     llm,
     loomloom,
     material,
-    metaso_minimax,
-    muapi,
-    ofox,
     sonilo,
     subtitle,
     task_artifacts,
     twelvelabs,
     video,
-    volcengine_seedance,
     voice,
 )
 from app.services import upload_post
 from app.services import state as sm
+from app.services import video_providers
 from app.utils import file_security, utils
 from app.utils.subtitle_writer import staged_subtitle_file
 
@@ -94,11 +91,13 @@ _VIDEO_MUSIC_PROVIDERS = {
 }
 
 
-_SUPPORTED_VIDEO_SOURCES = frozenset({
-    "pexels", "pixabay", "coverr", "local", "wavespeed",
-    "volcengine_seedance", "ofox", "metaso_minimax", "muapi",
-    "loomloom", "openai_image",
+# 库存素材源与本地/中间产物源。付费 AI 生成源由 video_providers 注册表提供，
+# 新增一个生成源不需要再改这里。
+_NON_GENERATED_VIDEO_SOURCES = frozenset({
+    "pexels", "pixabay", "coverr", "local", "loomloom", "openai_image",
 })
+
+_SUPPORTED_VIDEO_SOURCES = _NON_GENERATED_VIDEO_SOURCES | video_providers.all_provider_ids()
 
 
 def _get_video_music_prompt(params: VideoParams) -> str:
@@ -817,80 +816,29 @@ def get_video_materials(
                 # 进度条不再长时间停在 40%。
                 progress_callback=_stage_progress_reporter(task_id, 40, 50),
             )
-        except volcengine_seedance.VolcEngineSeedanceError as exc:
-            # 未确认状态和已生成但下载失败都对应一个可在方舟控制台恢复的远端
-            # 任务。统一从异常携带的 task_id 写入失败状态，避免不同异常分支
-            # 各自维护恢复信息并在后续扩展时再次遗漏。
-            remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
-            details = (
-                {"volcengine_seedance_task_id": remote_task_id}
-                if remote_task_id
-                else None
-            )
-            _mark_task_failed(
-                task_id,
-                "materials",
-                str(exc),
-                details=details,
-            )
-            return None
-        except (
-            material.WaveSpeedUnconfirmedTaskError,
-            material.WaveSpeedDownloadError,
-        ) as exc:
-            # Once a paid prediction exists, a polling or download failure must
-            # leave its ID in task state. Earlier successful clips cannot turn
-            # this incomplete run into an apparently completed video task.
-            prediction_id = str(getattr(exc, "prediction_id", "") or "").strip()
-            details = {"wavespeed_prediction_id": prediction_id} if prediction_id else None
-            _mark_task_failed(task_id, "materials", str(exc), details=details)
-            return None
         except material.OpenAIImagePaidResultError as exc:
             # A paid request with an uncertain response, failed result download,
             # or failed local render must stop before another image order.
             _mark_task_failed(task_id, "materials", str(exc))
             return None
-        except ofox.OFoxError as exc:
-            # 与方舟同一恢复语义：未确认状态和已生成但下载失败都对应一个可在
-            # OFox 控制台恢复的远端任务，统一从异常携带的 task_id 写入失败状态。
-            remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
+        except video_providers.VideoProviderError as exc:
+            # 所有付费生成源的失败都经由这里。未确认状态和已生成但下载失败都
+            # 对应一个可在供应商控制台恢复的远端任务，因此统一从异常携带的
+            # 远端 ID 写入失败状态——字段名来自 provider spec，避免不同分支
+            # 各自维护恢复信息并在后续扩展时再次遗漏。
+            spec = video_providers.get_spec(
+                str(getattr(exc, "provider_id", "") or "")
+            )
+            remote_id = str(
+                getattr(exc, spec.remote_task_id_attr if spec else "task_id", "")
+                or ""
+            ).strip()
             details = (
-                {"ofox_task_id": remote_task_id} if remote_task_id else None
+                {spec.resolved_error_details_key: remote_id}
+                if spec and remote_id
+                else None
             )
-            _mark_task_failed(
-                task_id,
-                "materials",
-                str(exc),
-                details=details,
-            )
-            return None
-        except metaso_minimax.MetasoMiniMaxError as exc:
-            # 秘塔任务与方舟任务使用不同的恢复入口和字段名，不能合并成一个
-            # 模糊的 remote_task_id。保留明确 Provider 前缀便于 API、WebUI
-            # 和运维日志直接定位对应平台。
-            remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
-            details = (
-                {"metaso_minimax_task_id": remote_task_id} if remote_task_id else None
-            )
-            _mark_task_failed(
-                task_id,
-                "materials",
-                str(exc),
-                details=details,
-            )
-            return None
-        except muapi.MuAPIError as exc:
-            # MuAPI tasks are billable after acceptance.  Preserve the remote
-            # request ID on any ambiguous or post-completion failure so the
-            # user can recover it from the provider dashboard.
-            remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
-            details = {"muapi_task_id": remote_task_id} if remote_task_id else None
-            _mark_task_failed(
-                task_id,
-                "materials",
-                str(exc),
-                details=details,
-            )
+            _mark_task_failed(task_id, "materials", str(exc), details=details)
             return None
         if not downloaded_videos:
             _mark_task_failed(
@@ -1040,6 +988,10 @@ def generate_final_videos(
             max_clip_duration=params.video_clip_duration,
             threads=params.n_threads,
             clip_speed=params.video_clip_speed,
+            # 原生音轨必须在片段拼接阶段就写进中间文件，最终混音才有声音可用。
+            native_audio_enabled=bool(
+                getattr(params, "native_audio_enabled", False)
+            ),
             progress_callback=_stage_progress_reporter(
                 task_id, _progress, _progress + combine_share
             ),
@@ -1531,54 +1483,31 @@ def _run_pipeline(
         except ValueError as exc:
             return _mark_task_failed(task_id, "preflight", str(exc))
 
+    # 原生音轨音量非法会在混音阶段污染整条音频链，且很难从成片反查，
+    # 因此在任何生成服务开始消耗额度之前就拒绝。
+    try:
+        video.validate_native_audio(params)
+    except ValueError as exc:
+        return _mark_task_failed(task_id, "preflight", str(exc))
+
     if stop_at in {"materials", "video"} and params.video_source not in _SUPPORTED_VIDEO_SOURCES:
         return _mark_task_failed(
             task_id, "preflight", f"unsupported video source: {params.video_source!r}"
         )
 
-    if (
-        stop_at in {"materials", "video"}
-        and params.video_source == "volcengine_seedance"
-        and not volcengine_seedance.is_enabled()
-    ):
-        return _mark_task_failed(
-            task_id,
-            "preflight",
-            "Volcano Engine Seedance requires an Ark API key",
-        )
-
-    if (
-        stop_at in {"materials", "video"}
-        and params.video_source == "ofox"
-        and not ofox.is_enabled()
-    ):
-        return _mark_task_failed(
-            task_id,
-            "preflight",
-            "OFox video generation requires an OFox API key",
-        )
-
-    if (
-        stop_at in {"materials", "video"}
-        and params.video_source == "metaso_minimax"
-        and not metaso_minimax.is_enabled()
-    ):
-        return _mark_task_failed(
-            task_id,
-            "preflight",
-            "Metaso MiniMax requires an API key",
-        )
-
-    if (
-        stop_at in {"materials", "video"}
-        and params.video_source == "muapi"
-        and not muapi.is_enabled()
-    ):
-        return _mark_task_failed(
-            task_id,
-            "preflight",
-            "MuAPI video generation requires a MuAPI API key",
-        )
+    # 付费 AI 生成源在消耗任何额度前先校验凭据。各源的提示文案来自 spec，
+    # 这里不再逐个 `if video_source == ...`，新增一个生成源只要在
+    # video_providers 里登记并声明 missing_credentials_message 即可。
+    if stop_at in {"materials", "video"}:
+        generated_spec = video_providers.get_spec(params.video_source or "")
+        if (
+            generated_spec is not None
+            and generated_spec.missing_credentials_message
+            and not video_providers.is_enabled(generated_spec.provider_id)
+        ):
+            return _mark_task_failed(
+                task_id, "preflight", generated_spec.missing_credentials_message
+            )
 
     if (
         stop_at in {"materials", "video"}

@@ -122,6 +122,30 @@ volcengine_seedance_poll_interval = 5
 volcengine_seedance_run_timeout = 1800
 volcengine_seedance_watermark = false
 
+# Volcano Engine Ark Seedance 2.5 uses the same asynchronous video-generation API
+# as the 1.0 model above, with a longer 4-30 second range, 4k output, native
+# image-to-video (first frame) and native audio generation.
+# When seedance25_api_key is empty, VOLCENGINE_ARK_API_KEY is used, followed by
+# the existing volcengine_api_key LLM setting — the same fallback chain as 1.0,
+# so an account already configured for Ark needs no second key.
+# Generation is billed per submitted clip.
+seedance25_api_key = ""
+seedance25_base_url = "https://ark.cn-beijing.volces.com/api/v3"
+# Official Seedance 2.5 model that supports text-to-video, image-to-video and
+# audio, with 4-30 second clips. Replace with an enabled model or Endpoint ID
+# from your Ark account if needed.
+seedance25_model = "doubao-seedance-2-5-260628"
+seedance25_resolution = "1080p" # "480p", "720p", "1080p", or "4k"
+seedance25_min_duration = 4
+seedance25_max_duration = 30
+seedance25_poll_interval = 5
+seedance25_run_timeout = 1800
+seedance25_watermark = false
+# Let the model generate a video that already contains audio (ambience, dialogue,
+# sound effects). When the editing pipeline is not configured to keep the native
+# track, the audio is simply dropped at mixdown time.
+seedance25_generate_audio = true
+
 # OFox (https://ofox.ai) exposes multiple text-to-video models (Seedance, Wan,
 # and more) behind one API key using an asynchronous /v1/videos API.
 # Create an API key at https://ofox.ai
