@@ -17,6 +17,7 @@ import cli
 from app.config import config as app_config
 from app.models import schema as app_schema
 from app.models.schema import VideoTransitionMode
+from app.services import video_providers
 
 
 class TestCli(unittest.TestCase):
@@ -29,7 +30,24 @@ class TestCli(unittest.TestCase):
         ui_patch.start()
         self.addCleanup(ui_patch.stop)
 
-    def test_default_voice_is_valid_edge_tts_voice(self):
+    def test_video_source_choices_stay_in_sync_with_provider_registry(self):
+        """CLI 的来源清单必须覆盖注册表里的全部生成源。
+
+        ``cli.py`` 刻意不在 import 期导入注册表（``--help`` 不能加载配置），
+        因此这份清单仍是静态的。新增 Provider 时本用例会失败，提醒同步更新，
+        避免出现「WebUI 能选、CLI 报参数非法」的漂移。
+        """
+        registered = {
+            spec.provider_id for spec in video_providers.all_specs("ai_video")
+        }
+        missing = registered - set(cli._CLI_VIDEO_SOURCES)
+        self.assertEqual(
+            missing,
+            set(),
+            f"CLI video sources missing registered providers: {sorted(missing)}",
+        )
+
+
         args = cli.parse_args(["--video-subject", "测试主题"])
         params = cli.build_video_params(args)
 

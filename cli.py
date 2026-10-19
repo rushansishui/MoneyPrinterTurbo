@@ -36,17 +36,32 @@ _BATCH_FILE_MAX_BYTES = 1024 * 1024
 _BATCH_TASK_MAX_COUNT = 100
 # 单任务 argparse 和批量清单必须共享同一来源集合。此前两处手工维护导致
 # openai_image 只在单任务入口可用；集中定义后，新增 Provider 不会再次遗漏
-# 批量校验。这里仅包含 CLI 已公开支持的来源，不强行暴露 WebUI 专属流程。
+# 批量校验。
+#
+# 这里刻意保留静态字面量，而不是在 import 期从注册表派生：``cli.py --help``
+# 必须能在不加载 config.toml 的前提下完成（见 test_cli 的帮助命令契约），
+# 而导入 video_providers 会连带加载 app.config。
+#
+# 同时它必须是纯字面量（不能用 ``(*a, *b)`` 展开）：既有的注册表一致性护栏
+# （test_provider_registry_contract / test_mpt_agent_skill）用
+# ``ast.literal_eval`` 直接读取这个赋值，星号展开会解析失败。与注册表的同步
+# 由那两条护栏保证——新增 Provider 时它们会失败并提示补全这里。
+#
+# 刻意**不包含** ``loomloom``：该来源要求先经过报价确认并构造
+# ``LoomLoomConfirmedVideoRequest``（含 run/batch 与 listing_version_id），
+# 命令行无法完成这个交互式前置流程，收录进来只会让用户拿到一个必然失败的
+# 参数。WebUI 可以承载该流程，因此它的来源分组里有 loomloom。
+# ``docs/skill/mpt_agent.py`` 的 SUPPORTED_SOURCES 与此保持一致。
 _CLI_VIDEO_SOURCES = (
     "pexels",
     "pixabay",
     "coverr",
-    "wavespeed",
     "volcengine_seedance",
     "seedance25",
     "ofox",
     "metaso_minimax",
     "muapi",
+    "wavespeed",
     "openai_image",
     "local",
 )
@@ -1201,9 +1216,10 @@ def _validate_batch_task_params(
     if not params.video_subject.strip() and not params.video_script.strip():
         raise ValueError("one of video_subject or video_script is required")
 
-    if params.video_source not in _CLI_VIDEO_SOURCES:
+    supported_sources = _CLI_VIDEO_SOURCES
+    if params.video_source not in supported_sources:
         raise ValueError(
-            "video_source must be one of: " + ", ".join(_CLI_VIDEO_SOURCES)
+            "video_source must be one of: " + ", ".join(supported_sources)
         )
     for field_name, value in (
         ("video_aspect", params.video_aspect),
