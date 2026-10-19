@@ -9,7 +9,6 @@ from fastapi import BackgroundTasks, Depends, Path, Query, Request, UploadFile
 from fastapi.params import File
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from loguru import logger
-from starlette.background import BackgroundTask
 
 from app.config import config
 from app.controllers import base
@@ -49,6 +48,9 @@ _redis_db = config.app.get("redis_db", 0)
 _redis_password = config.app.get("redis_password", None)
 _max_concurrent_tasks = config.app.get("max_concurrent_tasks", 5)
 _max_queued_tasks = config.app.get("max_queued_tasks", 100)
+# 视频流式响应的分块大小。太小时系统调用与协程切换成为主要开销，
+# 太大则拖长首字节延迟并占用更多内存；64KB 是两者之间的折中。
+_VIDEO_STREAM_CHUNK_BYTES = 64 * 1024
 
 
 def _build_redis_url(host: str, port: int, db: int, password: str | None) -> str:
@@ -552,7 +554,10 @@ async def stream_video(request: Request, file_path: str):
             video_file.seek(start, os.SEEK_SET)
             remaining = length
             while remaining > 0:
-                data = video_file.read(min(4096, remaining))
+                # 4KB 分块会让 100MB 成片产生约 25000 次 read + yield，拖动
+                # 进度条或多人同时观看时上下文切换开销明显。64KB 仍是内存
+                # 友好的粒度，同时把系统调用次数降低一个数量级。
+                data = video_file.read(min(_VIDEO_STREAM_CHUNK_BYTES, remaining))
                 if not data:
                     break
                 remaining -= len(data)
@@ -560,10 +565,11 @@ async def stream_video(request: Request, file_path: str):
         finally:
             video_file.close()
 
+    # 关闭动作只保留在迭代器的 finally 里。此前同时挂 BackgroundTask 会造成
+    # 两条路径都关同一个文件，清理归属不明确（虽然是幂等的）。
     response = StreamingResponse(
         file_iterator(),
         media_type="video/mp4",
-        background=BackgroundTask(video_file.close),
     )
     response.headers["Accept-Ranges"] = "bytes"
     response.headers["Content-Length"] = str(length)
