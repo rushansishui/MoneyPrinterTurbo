@@ -372,7 +372,9 @@ def test_batch_candidate_autofill_once_preserves_manual_count(script):
 
 def test_reference_price_copy_does_not_promise_quote_is_final():
     for locale in ("zh", "en"):
-        messages = json.loads((MAIN.parent / "i18n" / f"{locale}.json").read_text())
+        messages = json.loads(
+            (MAIN.parent / "i18n" / f"{locale}.json").read_text(encoding="utf-8")
+        )
         # 价格仅作选择参考，避免与“不完整估算仍可能扣费”的警告矛盾。
         text = messages["Translation"]["AI Video Model Reference Price"]
         assert ("实际模型调用" if locale == "zh" else "actual model usage") in text
