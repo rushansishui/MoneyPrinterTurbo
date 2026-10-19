@@ -33,16 +33,52 @@ class VideoTransitionMode(str, Enum):
 
 class VideoAspect(str, Enum):
     landscape = "16:9"
+    landscape_4_3 = "4:3"
     portrait = "9:16"
+    portrait_3_4 = "3:4"
     square = "1:1"
+    cinematic = "21:9"
+    # ``adaptive`` 不是一个画布规格，而是「由模型依据输入素材决定画幅」的生成
+    # 指令。它只对支持该参数的 provider 有意义，因此**不允许**出现在主视频
+    # 流水线（配音 → 字幕 → 剪辑）里——那条流水线必须先有一块确定的画布。
+    # ``to_resolution()`` 对它直接报错，而不是返回 (0, 0)：后者会在
+    # ``video_width / video_height`` 处变成难以定位的 ZeroDivisionError。
+    adaptive = "adaptive"
+
+    @property
+    def is_portrait(self) -> bool:
+        return self in (VideoAspect.portrait, VideoAspect.portrait_3_4)
+
+    @property
+    def is_landscape(self) -> bool:
+        return self in (
+            VideoAspect.landscape,
+            VideoAspect.landscape_4_3,
+            VideoAspect.cinematic,
+        )
+
+    @property
+    def is_square(self) -> bool:
+        return self == VideoAspect.square
 
     def to_resolution(self):
         if self == VideoAspect.landscape:
             return 1920, 1080
+        elif self == VideoAspect.landscape_4_3:
+            return 1664, 1248
         elif self == VideoAspect.portrait:
             return 1080, 1920
+        elif self == VideoAspect.portrait_3_4:
+            return 1248, 1664
         elif self == VideoAspect.square:
             return 1080, 1080
+        elif self == VideoAspect.cinematic:
+            return 2206, 946
+        elif self == VideoAspect.adaptive:
+            raise ValueError(
+                "adaptive video aspect has no fixed resolution; "
+                "it is only valid for providers that support model-chosen ratios"
+            )
         raise ValueError(f"unsupported video aspect: {self}")
 
 
@@ -107,6 +143,22 @@ class VideoParams(BaseModel):
     video_script: str = ""  # Script used to generate the video
     video_terms: Optional[str | List[str]] = None  # Keywords used to generate the video
     video_aspect: Optional[VideoAspect] = VideoAspect.portrait.value
+
+    @pydantic.field_validator("video_aspect")
+    @classmethod
+    def _reject_adaptive_aspect(cls, value):
+        """主视频流水线必须有确定画布，拒绝 ``adaptive``。
+
+        ``adaptive`` 只对支持「由模型决定画幅」的 AI 生成源有意义。它一旦
+        进入这条流水线，``to_resolution()`` 会在素材搜索或合成阶段抛错，
+        表现为任务中途失败而不是在入口被拒绝。
+        """
+        if value is not None and str(getattr(value, "value", value)) == "adaptive":
+            raise ValueError(
+                "adaptive video aspect is only supported by AI video providers"
+            )
+        return value
+
     video_fit_mode: VideoFitMode = VideoFitMode.cover
     video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.random.value
     video_transition_mode: Optional[VideoTransitionMode] = None
@@ -601,12 +653,27 @@ class FirstFrameInput(BaseModel):
     origin: Literal["upload", "generated", "stock"] = "upload"
 
 
+class ReferenceAssetInput(BaseModel):
+    """Seedance 2.5 多模态参考素材（图片、视频或音频）。"""
+
+    kind: Literal["image", "video", "audio"]
+    source: Literal["local_path", "url", "asset_id"]
+    value: str = Field(min_length=1)
+    mime: str = ""
+
+
 class AIVideoGenerateRequest(BaseModel):
     provider: str = Field(min_length=1)
-    prompt: str = Field(min_length=1, max_length=7000)
-    duration: int = Field(default=5, ge=1, le=60)
+    # Seedance 2.5 的多模态模式允许图片或视频作为唯一输入，因此文本不能
+    # 在 schema 层标成必填；服务层会确保至少提供文本或一个视觉输入。
+    prompt: str = Field(default="", max_length=7000)
+    # 方舟允许 -1，表示依据输入素材自动适配时长。
+    duration: int = Field(default=5, ge=-1, le=60)
     video_aspect: VideoAspect = VideoAspect.portrait
     first_frame: Optional[FirstFrameInput] = None
+    reference_assets: List[ReferenceAssetInput] = Field(default_factory=list)
+    # 方舟全模态参考任务的可选引导类型；保持透传以兼容平台后续新增枚举值。
+    omni_reference_task_type: Literal["", "auto", "edit", "extend"] = ""
     # API 没有会话可以承载 WebUI 那样的确认框，因此计费确认必须显式入参。
     confirm_charge: bool = False
 
@@ -629,6 +696,8 @@ class AIVideoProviderData(BaseModel):
     label: str
     supports_image_to_video: bool
     supports_native_audio: bool
+    supports_reference_assets: bool
+    supports_auto_duration: bool
     requires_charge_confirmation: bool
     enabled: bool
 

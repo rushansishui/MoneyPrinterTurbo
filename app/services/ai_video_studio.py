@@ -22,7 +22,7 @@ from loguru import logger
 
 from app.models.schema import MaterialInfo, VideoAspect
 from app.services import material, video_providers
-from app.services.video_providers.spec import FirstFrame
+from app.services.video_providers.spec import FirstFrame, ReferenceAsset
 
 
 class AIVideoStudioError(ValueError):
@@ -69,6 +69,8 @@ def list_providers() -> list[dict[str, Any]]:
                 "label": spec.default_label,
                 "supports_image_to_video": spec.supports_image_to_video,
                 "supports_native_audio": spec.supports_native_audio,
+                "supports_reference_assets": spec.supports_reference_assets,
+                "supports_auto_duration": spec.supports_auto_duration,
                 "requires_charge_confirmation": spec.requires_charge_confirmation,
                 "enabled": video_providers.is_enabled(spec.provider_id),
             }
@@ -113,8 +115,53 @@ def _normalize_first_frame(value: Any) -> FirstFrame | None:
     raise AIVideoStudioError("first_frame must be an object")
 
 
+def _normalize_reference_assets(value: Any) -> list[ReferenceAsset]:
+    """Convert API/WebUI reference-asset dictionaries to provider values."""
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise AIVideoStudioError("reference_assets must be a list")
+
+    assets: list[ReferenceAsset] = []
+    for index, item in enumerate(value):
+        if isinstance(item, ReferenceAsset):
+            asset = item
+        elif isinstance(item, Mapping):
+            kind = str(item.get("kind") or "").strip()
+            source = str(item.get("source") or "").strip()
+            if kind not in {"image", "video", "audio"}:
+                raise AIVideoStudioError(
+                    f"reference_assets[{index}].kind must be image, video, or audio"
+                )
+            if source not in {"local_path", "url", "asset_id"}:
+                raise AIVideoStudioError(
+                    f"reference_assets[{index}].source must be local_path, url, or asset_id"
+                )
+            try:
+                asset = ReferenceAsset(
+                    kind=kind,
+                    source=source,
+                    value=str(item.get("value") or "").strip(),
+                    mime=str(item.get("mime") or "").strip(),
+                )
+            except ValueError as exc:
+                raise AIVideoStudioError(
+                    f"invalid reference_assets[{index}]: {exc}"
+                ) from exc
+        else:
+            raise AIVideoStudioError(
+                f"reference_assets[{index}] must be an object"
+            )
+        assets.append(asset)
+    return assets
+
+
 def _clip_dimensions(item: MaterialInfo, aspect: VideoAspect) -> tuple[int, int]:
-    """优先使用 provider 回报的真实尺寸，缺失时回退画幅换算值。"""
+    """优先使用 provider 回报的真实尺寸，缺失时回退画幅换算值。
+
+    ``adaptive`` 没有固定分辨率，provider 也没回报尺寸时只能返回 (0, 0)，
+    由调用方决定是否回读文件真实尺寸。
+    """
     source_info = item.source_info if isinstance(item.source_info, dict) else {}
     rendition = source_info.get("rendition")
     if isinstance(rendition, dict):
@@ -125,7 +172,78 @@ def _clip_dimensions(item: MaterialInfo, aspect: VideoAspect) -> tuple[int, int]
             width = height = 0
         if width > 0 and height > 0:
             return width, height
-    return aspect.to_resolution()
+    try:
+        return aspect.to_resolution()
+    except ValueError:
+        return 0, 0
+
+
+def _probe_downloaded_clip(file_path: str) -> tuple[int, int, int]:
+    """读取已下载文件的行之有效的时长与尺寸。
+
+    只在 provider 没有给出可用元数据时调用：``duration=-1``（自动时长）和
+    ``adaptive`` 画幅都会让上游回报 ``-1`` / ``0x0``，直接透传会让 API 调用方
+    拿到负数时长与零尺寸。探测失败不抛异常——视频已经付费生成并下载完成，
+    不能因为读不出元数据就丢掉产物。
+    """
+    clip = None
+    try:
+        clip = material.VideoFileClip(file_path)
+        duration = float(clip.duration or 0)
+        width, height = clip.size
+        return (
+            int(round(duration)) if duration > 0 else 0,
+            int(width or 0),
+            int(height or 0),
+        )
+    except Exception as exc:
+        logger.warning(
+            "could not probe generated video metadata, leaving it unset: "
+            f"path={file_path}, error={type(exc).__name__}, detail={exc}"
+        )
+        return 0, 0, 0
+    finally:
+        if clip is not None:
+            try:
+                clip.close()
+            except Exception as close_error:
+                logger.warning(
+                    "failed to close generated video after metadata probe: "
+                    f"path={file_path}, error={type(close_error).__name__}, "
+                    f"detail={close_error}"
+                )
+
+
+def _resolve_clip_metadata(
+    item: MaterialInfo,
+    aspect: VideoAspect,
+    requested_duration: int,
+    saved_path: str,
+) -> tuple[int, int, int]:
+    """把 provider 回报的元数据归一化成可用的 ``(duration, width, height)``。
+
+    上游可能给出三种不可用取值：``duration=-1``（自动时长）、``None``（未回报）
+    以及 ``0x0`` 尺寸。任一出现时才回读文件，避免为每段视频都多开一次解码器。
+    """
+    reported_duration = int(item.duration or 0)
+    width, height = _clip_dimensions(item, aspect)
+    needs_probe = reported_duration <= 0 or width <= 0 or height <= 0
+    probed_duration, probed_width, probed_height = (
+        _probe_downloaded_clip(saved_path) if needs_probe else (0, 0, 0)
+    )
+    if reported_duration > 0:
+        duration = reported_duration
+    elif probed_duration > 0:
+        duration = probed_duration
+    elif requested_duration > 0:
+        duration = requested_duration
+    else:
+        duration = 0
+    return (
+        duration,
+        width or probed_width,
+        height or probed_height,
+    )
 
 
 def generate_and_save(
@@ -135,6 +253,8 @@ def generate_and_save(
     duration: int,
     video_aspect: VideoAspect | str = VideoAspect.portrait,
     first_frame: Any = None,
+    reference_assets: Any = None,
+    omni_reference_task_type: str = "",
     confirm_charge: bool = False,
     save_dir: str = "",
 ) -> list[GeneratedClip]:
@@ -146,19 +266,47 @@ def generate_and_save(
     spec = _resolve_spec(provider_id)
 
     term = str(prompt or "").strip()
-    if not term:
-        raise AIVideoStudioError("prompt must not be empty")
     try:
         clip_duration = int(duration)
     except (TypeError, ValueError, OverflowError) as exc:
         raise AIVideoStudioError("duration must be a positive integer") from exc
-    if clip_duration <= 0:
-        raise AIVideoStudioError("duration must be a positive integer")
+    if clip_duration == 0 or clip_duration < -1:
+        raise AIVideoStudioError("duration must be -1 or a positive integer")
     aspect = VideoAspect(video_aspect)
     frame = _normalize_first_frame(first_frame)
+    assets = _normalize_reference_assets(reference_assets)
+    reference_task_type = str(omni_reference_task_type or "").strip().lower()
     if frame is not None and not spec.supports_image_to_video:
         raise AIVideoStudioError(
             f"{spec.provider_id} does not support image-to-video generation"
+        )
+    if assets and not spec.supports_reference_assets:
+        raise AIVideoStudioError(
+            f"{spec.provider_id} does not support reference assets"
+        )
+    if reference_task_type and not assets:
+        raise AIVideoStudioError(
+            "omni_reference_task_type requires at least one reference asset"
+        )
+    if assets and not reference_task_type:
+        reference_task_type = "auto"
+    if reference_task_type not in {"", "auto", "edit", "extend"}:
+        raise AIVideoStudioError(
+            "omni_reference_task_type must be auto, edit, or extend"
+        )
+    # -1 是方舟的「自动时长」语义。其余 provider 会把它夹到 1 秒后照常下单，
+    # 必须在提交前拒绝，而不是让调用方拿到一段无法使用的付费视频。
+    if clip_duration == -1 and not spec.supports_auto_duration:
+        raise AIVideoStudioError(
+            f"{spec.provider_id} does not support automatic duration (-1)"
+        )
+
+    # Seedance 2.5 的「参考生视频」由任一种参考素材触发，参考音频单独使用
+    # 也是合法组合；没有参考素材时才要求文本提示词。
+    has_reference_input = frame is not None or bool(assets)
+    if not term and not has_reference_input:
+        raise AIVideoStudioError(
+            "provide a prompt or at least one reference asset"
         )
 
     # 计费确认必须发生在任何凭据读取与远端请求之前。
@@ -177,7 +325,8 @@ def generate_and_save(
     logger.info(
         f"standalone ai video generation: provider={spec.provider_id}, "
         f"duration={clip_duration}s, aspect={aspect.value}, "
-        f"image_to_video={frame is not None}"
+        f"image_to_video={frame is not None}, references={len(assets)}, "
+        f"reference_task_type={reference_task_type or 'auto'}"
     )
 
     try:
@@ -187,6 +336,8 @@ def generate_and_save(
             minimum_duration=clip_duration,
             video_aspect=aspect,
             first_frame=frame,
+            reference_assets=assets,
+            omni_reference_task_type=reference_task_type,
         )
     except video_providers.VideoProviderError as exc:
         raise AIVideoGenerationError(
@@ -217,12 +368,14 @@ def generate_and_save(
                 provider_id=spec.provider_id,
                 task_id=remote_task_id,
             )
-        width, height = _clip_dimensions(item, aspect)
+        duration, width, height = _resolve_clip_metadata(
+            item, aspect, clip_duration, saved_path
+        )
         clips.append(
             GeneratedClip(
                 provider=spec.provider_id,
                 file_path=saved_path,
-                duration=int(item.duration or clip_duration),
+                duration=duration,
                 width=width,
                 height=height,
                 remote_task_id=remote_task_id,

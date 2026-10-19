@@ -45,6 +45,32 @@ class FirstFrame:
 
 
 @dataclass(frozen=True, slots=True)
+class ReferenceAsset:
+    """一条参考素材（图片 / 视频 / 音频）。
+
+    Seedance 2.5 的「全模态参考」允许在同一个请求里混合多种参考素材：图片
+    提供外观与风格、视频提供动作与运镜、音频提供音色与节奏。它们与首帧是
+    不同概念——首帧是"从哪里开始"，参考素材是"照着什么做"。
+
+    与 :class:`FirstFrame` 一样，这里只描述素材是什么，具体如何编码（base64
+    data URL / 公网 URL / 预签名地址）由各 provider 按自己的协议实现。
+    """
+
+    kind: Literal["image", "video", "audio"]
+    # 素材位置形态：本地文件路径或公网 URL。
+    source: Literal["local_path", "url", "asset_id"]
+    value: str
+    mime: str = ""
+
+    def __post_init__(self) -> None:
+        normalized_value = str(self.value or "").strip()
+        if not normalized_value:
+            raise ValueError("reference asset value must not be empty")
+        object.__setattr__(self, "value", normalized_value)
+        object.__setattr__(self, "mime", str(self.mime or "").strip())
+
+
+@dataclass(frozen=True, slots=True)
 class VideoProviderSpec:
     """一个视频源的静态元数据。
 
@@ -63,6 +89,12 @@ class VideoProviderSpec:
     requires_charge_confirmation: bool = True
     supports_image_to_video: bool = False
     supports_native_audio: bool = False
+    # 是否支持「参考素材」（reference_image / reference_video / reference_audio
+    # 混用）。与首帧是不同概念：首帧决定起点，参考素材决定照着什么生成。
+    supports_reference_assets: bool = False
+    # 是否支持 ``duration=-1``（由模型依据输入素材自动决定时长）。多数源把
+    # 时长当正整数处理，直接透传 -1 会被它们静默夹到 1 秒并照常下单。
+    supports_auto_duration: bool = False
     # 下载时长核算策略：False 用 provider 回报的时长，True 用本地实测文件时长。
     measure_downloaded_duration: bool = False
     # 远端任务 ID 在异常对象上的属性名与写入失败详情时的键名。

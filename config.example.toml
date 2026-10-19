@@ -123,8 +123,9 @@ volcengine_seedance_run_timeout = 1800
 volcengine_seedance_watermark = false
 
 # Volcano Engine Ark Seedance 2.5 uses the same asynchronous video-generation API
-# as the 1.0 model above, with a longer 4-30 second range, 4k output, native
-# image-to-video (first frame) and native audio generation.
+# as the 1.0 model above, with a longer 4-30 second range, native
+# image-to-video (first frame), full-modal reference assets, and native audio
+# generation. Ark Seedance 2.5 output supports 480p, 720p, and 1080p.
 # When seedance25_api_key is empty, VOLCENGINE_ARK_API_KEY is used, followed by
 # the existing volcengine_api_key LLM setting — the same fallback chain as 1.0,
 # so an account already configured for Ark needs no second key.
@@ -135,7 +136,7 @@ seedance25_base_url = "https://ark.cn-beijing.volces.com/api/v3"
 # audio, with 4-30 second clips. Replace with an enabled model or Endpoint ID
 # from your Ark account if needed.
 seedance25_model = "doubao-seedance-2-5-260628"
-seedance25_resolution = "1080p" # "480p", "720p", "1080p", or "4k"
+seedance25_resolution = "1080p" # "480p", "720p", or "1080p"
 seedance25_min_duration = 4
 seedance25_max_duration = 30
 seedance25_poll_interval = 5
