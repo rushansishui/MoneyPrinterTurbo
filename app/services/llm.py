@@ -40,6 +40,28 @@ _CONNECTION_FAILURE_MARKERS = (
     "connection aborted",
     "failed to connect",
 )
+# 这些失败来自配置缺失或 Provider 名非法，重试不会改变结果：每次重试都要等
+# 一轮超时并产生一次网络请求，用户只会看到更晚才出现的同一条错误。命中的
+# 错误直接终止重试循环，把失败信息尽快交回任务编排层。
+_NON_RETRYABLE_LLM_ERROR_MARKERS = (
+    "api_key is not set",
+    "model_name is not set",
+    "base_url is not set",
+    "unsupported llm provider",
+)
+
+
+def _is_retryable_llm_error(message: object) -> bool:
+    """判断一条 ``"Error: ..."`` 文案是否值得重试。
+
+    ``_generate_response`` 把所有异常压平成文本，调用层无法区分错误类型。
+    这里按"配置类错误不可能自愈"做保守分类：只有明确可自愈的临时故障
+    （超时、连接失败、限流、服务端错误）才继续重试。
+    """
+    normalized = str(message or "").lower()
+    return not any(
+        marker in normalized for marker in _NON_RETRYABLE_LLM_ERROR_MARKERS
+    )
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _UNCLOSED_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*$", re.IGNORECASE | re.DOTALL)
 _URL_USERINFO_RE = re.compile(
@@ -950,6 +972,9 @@ def generate_script(
             if isinstance(response, str) and response.startswith("Error: "):
                 # _generate_response returns provider failures as text. Passing
                 # that text through would make the task treat it as narration.
+                if not _is_retryable_llm_error(response):
+                    logger.error(f"failed to generate script: {response}")
+                    return ""
                 raise ValueError(response)
             if response:
                 candidate = format_response(response).strip()
