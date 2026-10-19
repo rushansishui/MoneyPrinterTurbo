@@ -646,7 +646,26 @@ ui = _SynchronizedConfig(
 
 hostname = socket.gethostname()
 
-log_level = _cfg.get("log_level", "DEBUG")
+_LOG_LEVELS = frozenset(
+    {"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"}
+)
+
+
+def _normalize_log_level(value) -> str:
+    """把配置里的日志级别归一化成 loguru 认识的大写名。
+
+    loguru 的 ``level=`` 只接受精确匹配的大写名称，用户在 config.toml 里写成
+    ``"info"``（Python 的常见写法）会让 ``import app.config`` 直接抛
+    ``ValueError``，表现为进程启动即崩且 traceback 指向 loguru 而非配置项。
+    """
+    level = str(value or "DEBUG").strip().upper()
+    if level in _LOG_LEVELS:
+        return level
+    logger.warning(f"invalid log_level {value!r}, falling back to DEBUG")
+    return "DEBUG"
+
+
+log_level = _normalize_log_level(_cfg.get("log_level", "DEBUG"))
 listen_host = _cfg.get("listen_host", "0.0.0.0")
 listen_port = _cfg.get("listen_port", 8080)
 project_name = _cfg.get("project_name", "MoneyPrinterTurbo")
