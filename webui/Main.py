@@ -2327,9 +2327,12 @@ def _render_top_bar():
                     # 写入 config.toml，后续新会话将优先使用该明确选择。
                     _set_runtime_config("ui", "language", selected_language_code)
                     _save_runtime_config()
-                    # 切换语言会先重跑顶部栏，正文控件尚未渲染就触发 rerun。
-                    # 显式保留本次创作内容，防止 Streamlit 清理旧控件状态后，
-                    # 新语言页面把已经输入的主题、文案和关键词重置为空。
+                    # 切换语言后紧接着 rerun：控件尚未在本次 run 中重新渲染，
+                    # Streamlit 会清理旧控件状态。这几句"把值写回自身"并不是
+                    # 恒等操作——它会把这些 key 标记为已被显式赋值，从而在
+                    # 下一轮 run 中保留用户已填写的主题、文案和关键词。
+                    # 删除它们会让正文内容在切换语言后被清空
+                    # （test_webui_catalan 会失败）。
                     for content_key in ("video_subject", "video_script", "video_terms"):
                         if content_key in st.session_state:
                             st.session_state[content_key] = st.session_state[content_key]
@@ -8326,12 +8329,17 @@ def _render_subtitle_settings(panel, params):
                     disabled=subtitle_settings_disabled,
                 )
                 try:
-                    params.custom_position = float(custom_position)
-                    if params.custom_position < 0 or params.custom_position > 100:
+                    parsed_position = float(custom_position)
+                    # NaN 与无穷大能通过下面的范围比较（NaN 与任何数比较都为
+                    # False），会被写进 config.toml 成为非法值。这里先拒绝。
+                    if not math.isfinite(parsed_position):
+                        st.error(tr("Please enter a valid number"))
+                    elif parsed_position < 0 or parsed_position > 100:
                         st.error(tr("Please enter a value between 0 and 100"))
                     else:
+                        params.custom_position = parsed_position
                         _set_runtime_config(
-                            "ui", "custom_position", params.custom_position
+                            "ui", "custom_position", parsed_position
                         )
                 except ValueError:
                     st.error(tr("Please enter a valid number"))
@@ -8615,19 +8623,7 @@ def _render_generation_controls(
             voxcpm_prompt_audio = _get_voxcpm_effective_prompt_audio()
             voxcpm_prompt_text = _get_voxcpm_prompt_text()
 
-        if params.video_source not in [
-            "pexels",
-            "pixabay",
-            "coverr",
-            "wavespeed",
-            "volcengine_seedance",
-            "ofox",
-            "metaso_minimax",
-            "muapi",
-            "loomloom",
-            "openai_image",
-            "local",
-        ]:
+        if params.video_source not in _ALL_VIDEO_SOURCES:
             _remove_active_generation_task(task_id)
             st.error(tr("Please Select a Valid Video Source"))
             st.stop()
