@@ -6,7 +6,6 @@ import shutil
 import subprocess
 from functools import lru_cache
 from pathlib import Path
-import threading
 from typing import Any, Iterable
 from uuid import uuid4
 
@@ -229,18 +228,6 @@ def check_ffmpeg_ready(timeout: int = 10) -> bool:
 
     logger.info(f"ffmpeg check passed, using: {ffmpeg_bin}")
     return True
-
-
-def run_in_background(func, *args, **kwargs):
-    def run():
-        try:
-            func(*args, **kwargs)
-        except Exception as e:
-            logger.error(f"run_in_background error: {e}", exc_info=True)
-
-    thread = threading.Thread(target=run, daemon=False)
-    thread.start()
-    return thread
 
 
 def time_convert_seconds_to_hmsm(seconds) -> str:
