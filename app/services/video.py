@@ -872,9 +872,12 @@ def close_clip(clip):
             
     except Exception as e:
         logger.error(f"failed to close clip: {str(e)}")
-    
+
     del clip
-    gc.collect()
+    # 这里不调用 gc.collect()：close_clip 在切片热路径上每片段都要执行，
+    # 而全量回收在持有大量帧缓存时是毫秒级开销（实测 200 次约 286ms）。
+    # reader.close() 已经释放了文件句柄，真正需要强制回收的时机是整批片段
+    # 处理完之后——由调用方在阶段结束时统一做一次。
 
 def _silent_audio_clip(duration: float) -> AudioClip:
     """生成一段与片段等长的静音音轨。
@@ -1361,7 +1364,11 @@ def combine_videos(
                     progress_callback, video_duration, required_video_duration
                 )
             next_candidate_index = candidate_index
-    
+
+    # 片段切片阶段结束，统一做一次全量回收。close_clip 自身不再触发
+    # gc.collect()，否则每个片段都要付一次毫秒级回收开销。
+    gc.collect()
+
     # loop processed clips until the video duration covers the audio duration and the small safety margin.
     if video_duration < required_video_duration:
         logger.warning(
@@ -2091,6 +2098,11 @@ def render_image_zoom_video(image_path: str, clip_duration: int = 5) -> str:
             video_file = os.path.join(
                 os.path.dirname(image_path), f"{source_identity}.zoom-{duration_identity}.mp4"
             )
+            # 文件名已经包含全部渲染输入（源图身份 + 时长），因此已存在的
+            # 非空文件可以直接复用。此前无条件重新编码：同一张图片在多个
+            # 任务里反复使用时会重复付出一次 30fps 的编码开销。
+            if os.path.exists(video_file) and os.path.getsize(video_file) > 0:
+                return video_file
             descriptor, temp_path = tempfile.mkstemp(
                 prefix=".image-zoom-",
                 suffix=".mp4",
