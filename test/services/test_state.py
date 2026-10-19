@@ -16,7 +16,8 @@ from app.services.state import MemoryState, RedisState
 class _FakeRedisPipeline:
     def __init__(self, redis):
         self.redis = redis
-        self.keys = []
+        # 记录待执行命令，保持与 redis-py pipeline 相同的“先排队后 execute”语义。
+        self.commands = []
 
     def __enter__(self):
         return self
@@ -25,11 +26,29 @@ class _FakeRedisPipeline:
         return None
 
     def hget(self, key, field):
-        self.keys.append((key, field))
+        self.commands.append(("hget", key, field))
+        return self
+
+    def hgetall(self, key):
+        self.commands.append(("hgetall", key, None))
         return self
 
     def execute(self, raise_on_error=True):
-        return [self.redis.data.get(key, {}).get(field.encode("utf-8")) for key, field in self.keys]
+        results = []
+        for command, key, field in self.commands:
+            # 真实 redis-py 接受 str 键；替身内部统一用 bytes 存放，避免
+            # str/bytes 混用导致查不到已写入的记录。
+            normalized_key = key.encode("utf-8") if isinstance(key, str) else key
+            if command == "hgetall":
+                results.append(self.redis.data.get(normalized_key, {}))
+            else:
+                results.append(
+                    self.redis.data.get(normalized_key, {}).get(
+                        field.encode("utf-8")
+                    )
+                )
+        self.commands = []
+        return results
 
 
 class _FakeRedis:
