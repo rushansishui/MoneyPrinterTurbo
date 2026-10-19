@@ -6,6 +6,17 @@ on:
     branches:
       - main
 
+# 测试 job 只需要读代码。未声明时 GITHUB_TOKEN 的权限取决于仓库设置，
+# 对仅做 checkout + 跑测试的流水线没有必要携带写权限。
+permissions:
+  contents: read
+
+# 同一分支连续 push 时取消旧 run：PR 合入会同时触发 pull_request 与 push
+# 两个事件，旧 run 不取消会白占 runner 并让状态难以判断。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   tests:
     name: Python ${{ matrix.python-version }} tests
