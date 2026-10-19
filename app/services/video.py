@@ -56,6 +56,7 @@ class SubClippedVideoClip:
         height=None,
         duration=None,
         source_file_path=None,
+        has_audio=None,
     ):
         self.file_path = file_path
         self.start_time = start_time
@@ -63,6 +64,8 @@ class SubClippedVideoClip:
         self.width = width
         self.height = height
         self.source_file_path = source_file_path or file_path
+        # 预扫描阶段判定一次，供原生音轨分支直接复用；None 表示尚未探测。
+        self.has_audio = has_audio
         if duration is None:
             self.duration = end_time - start_time
         else:
@@ -895,6 +898,7 @@ def _build_native_audio_segment(
     end_time: float,
     speed: float,
     target_duration: float,
+    has_audio: bool | None = None,
 ) -> AudioClip | None:
     """按与视频完全相同的时间变换构造素材原声片段。
 
@@ -903,17 +907,21 @@ def _build_native_audio_segment(
     音频片段，再把两者一起 mux 进同一个中间文件，音视频因此在片段成型时就已
     对齐，后续拼接与最终混音都不需要再计算时间轴。
 
+    ``has_audio`` 由调用方传入时省掉一次探测；缺省时才自己打开文件检查。
+    **探测必须带 ``audio=True``**：``_open_video_clip_quietly`` 默认不加载音轨，
+    用它探测会让 ``clip.audio`` 恒为 ``None``，把含音轨素材误判成静音。
+
     源素材没有音轨时返回 ``None``，由调用方决定是否补静音。
 
     返回的 AudioClip 持有自己的 ffmpeg reader，**调用方必须负责关闭**，否则
     Windows 上临时片段文件会因句柄未释放而无法删除。
     """
-    # 先只读元数据探测是否存在音轨，避免为无音轨素材白白启动一个音频 reader。
-    probe = _open_video_clip_quietly(source_path)
-    try:
-        has_audio = probe.audio is not None
-    finally:
-        close_clip(probe)
+    if has_audio is None:
+        probe = _open_video_clip_quietly(source_path, audio=True)
+        try:
+            has_audio = probe.audio is not None
+        finally:
+            close_clip(probe)
     if not has_audio:
         return None
 
@@ -1097,9 +1105,17 @@ def combine_videos(
     for video_path in video_paths:
         clip = None
         try:
-            clip = _open_video_clip_quietly(video_path)
+            # 原生音轨模式需要知道源文件是否带音轨。这里用同一次打开顺带判定，
+            # 避免为每个子片段单独探测（探测一次要启动一个音频 reader）。
+            # 默认模式不传 audio 关键字，保持与旧行为逐字节一致。
+            clip = (
+                _open_video_clip_quietly(video_path, audio=True)
+                if native_audio_enabled
+                else _open_video_clip_quietly(video_path)
+            )
             clip_duration = float(clip.duration)
             clip_w, clip_h = clip.size
+            clip_has_audio = getattr(clip, "audio", None) is not None
             if (
                 not math.isfinite(clip_duration)
                 or clip_duration <= 0
@@ -1134,6 +1150,7 @@ def combine_videos(
                         width=clip_w,
                         height=clip_h,
                         source_file_path=video_path,
+                        has_audio=clip_has_audio,
                     )
                 )
 
@@ -1239,6 +1256,7 @@ def combine_videos(
                     end_time=subclipped_item.end_time,
                     speed=normalized_clip_speed,
                     target_duration=clip.duration,
+                    has_audio=subclipped_item.has_audio,
                 )
                 # 无音轨素材必须补静音：concat 要求所有输入的流结构一致，
                 # 混有带/不带音轨的片段会让拼接失败或产出错位。
