@@ -555,7 +555,16 @@ def save_config():
     主要用于避免多标签页或快速 rerun 时损坏配置文件。
     """
     with _config_save_lock:
-        config_to_save = dict(_cfg)
+        # 以磁盘上的当前内容为基准，只覆盖本模块实际管理的分区。
+        # 之前直接用导入期的 ``_cfg`` 快照重写整个文件：用户在两次保存之间
+        # 手工编辑的 whisper / proxy 等分区会被静默回滚到启动时的旧值，而且
+        # 没有任何日志提示。
+        try:
+            config_to_save = _load_toml_config(config_file)
+        except (OSError, UnicodeError, ValueError, toml.TomlDecodeError):
+            # 文件暂时不可读或内容损坏：退回内存快照，至少不丢受管字段。
+            config_to_save = dict(_cfg)
+
         config_to_save["app"] = dict(app)
         config_to_save["azure"] = dict(azure)
         config_to_save["siliconflow"] = dict(siliconflow)
@@ -566,6 +575,9 @@ def save_config():
         config_to_save["fish_audio"] = dict(fish_audio)
         config_to_save["voxcpm"] = dict(voxcpm)
         config_to_save["ui"] = dict(ui)
+        # whisper / proxy 在运行期只被读取，没有任何代码修改它们，因此以磁盘
+        # 内容为准。若把它们也写成内存快照，用户手工编辑的 model_size 或代理
+        # 设置会在下一次保存时被回滚——这正是本次修复要消除的问题。
         serialized_config = toml.dumps(config_to_save)
 
         # WebUI 完整 rerun 结束时会调用保存。内容没有变化时直接返回，避免每次
