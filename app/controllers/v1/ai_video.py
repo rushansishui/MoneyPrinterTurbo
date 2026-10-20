@@ -66,6 +66,8 @@ def generate_ai_video(request: Request, body: AIVideoGenerateRequest):
             first_frame=(
                 body.first_frame.model_dump() if body.first_frame else None
             ),
+            reference_assets=[asset.model_dump() for asset in body.reference_assets],
+            omni_reference_task_type=body.omni_reference_task_type,
             # 服务层再校验一次：即使调用方绕过 Pydantic 也必须显式确认。
             confirm_charge=body.confirm_charge,
         )

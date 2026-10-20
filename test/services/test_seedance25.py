@@ -7,7 +7,7 @@
    三种首帧形态（公网 URL / 本地路径 base64 / 不支持的 asset_id）分别验证。
 2. **原生音频** —— ``generate_audio`` 跟随配置，关闭时字段不能出现在请求体里，
    避免"以为关了其实还在按带声音的视频计费"。
-3. **2.5 参数区间** —— 分辨率白名单新增 4k，时长上限放宽到 30 秒。
+3. **2.5 参数区间** —— 输出分辨率限制为 480p/720p/1080p，时长上限为 30 秒。
 
 全部用 mock 替换 requests/time，CI 不依赖真实网络与计费。
 """
@@ -25,6 +25,7 @@ from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect
 from app.services import material
 from app.services.video_providers import errors
+from app.services.video_providers.spec import ReferenceAsset
 from app.services.video_providers.sources import seedance25
 
 
@@ -162,8 +163,8 @@ def test_duration_is_clamped_to_the_2_5_range():
         assert post.call_args.kwargs["json"]["duration"] == expected
 
 
-def test_resolution_whitelist_includes_4k_and_rejects_unknown_values():
-    config.app["seedance25_resolution"] = "4k"
+def test_resolution_whitelist_rejects_unsupported_output_sizes():
+    config.app["seedance25_resolution"] = "720p"
     with (
         patch.object(
             seedance25.client.requests, "post", return_value=_response({"id": "t"})
@@ -174,12 +175,11 @@ def test_resolution_whitelist_includes_4k_and_rejects_unknown_values():
         patch.object(seedance25.polling.time, "sleep"),
     ):
         items = seedance25.generate_videos("x", minimum_duration=5)
-    assert post.call_args.kwargs["json"]["resolution"] == "4k"
-    # 4k 长边按 3840 记录。
-    assert items[0].source_info["rendition"]["width"] == 2160
-    assert items[0].source_info["rendition"]["height"] == 3840
+    assert post.call_args.kwargs["json"]["resolution"] == "720p"
+    assert items[0].source_info["rendition"]["width"] == 720
+    assert items[0].source_info["rendition"]["height"] == 1280
 
-    config.app["seedance25_resolution"] = "8k"
+    config.app["seedance25_resolution"] = "4k"
     with patch.object(seedance25.client.requests, "post") as post:
         with pytest.raises(seedance25.Seedance25Error, match="Unsupported"):
             seedance25.generate_videos("x", minimum_duration=5)
@@ -260,12 +260,19 @@ def test_image_to_video_from_local_path_encodes_base64_data_url(tmp_path):
     assert base64.b64decode(url.split(",", 1)[1]) == raw
 
 
-def test_image_to_video_rejects_unsupported_asset_id_kind():
+def test_image_to_video_accepts_asset_id():
     frame = seedance25.FirstFrame(kind="asset_id", value="asset-1")
-    with patch.object(seedance25.client.requests, "post") as post:
-        with pytest.raises(seedance25.Seedance25Error, match="public image URL"):
-            seedance25.generate_videos("x", minimum_duration=5, first_frame=frame)
-    post.assert_not_called()
+    with (
+        patch.object(
+            seedance25.client.requests, "post", return_value=_response({"id": "t"})
+        ) as post,
+        patch.object(
+            seedance25.polling.requests, "get", return_value=_completed_task()
+        ),
+        patch.object(seedance25.polling.time, "sleep"),
+    ):
+        seedance25.generate_videos("x", minimum_duration=5, first_frame=frame)
+    assert post.call_args.kwargs["json"]["content"][1]["image_url"]["url"] == "asset-1"
 
 
 def test_image_to_video_rejects_missing_and_empty_local_files(tmp_path):
@@ -294,6 +301,190 @@ def test_image_to_video_rejects_oversized_file(tmp_path, monkeypatch):
     with patch.object(seedance25.client.requests, "post") as post:
         with pytest.raises(seedance25.Seedance25Error, match="exceeds"):
             seedance25.generate_videos("x", minimum_duration=5, first_frame=frame)
+    post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 多模态参考素材
+# ---------------------------------------------------------------------------
+
+
+def test_reference_assets_are_submitted_with_official_roles():
+    assets = [
+        ReferenceAsset(
+            kind="image", source="url", value="https://img.test/style.png"
+        ),
+        ReferenceAsset(
+            kind="video", source="url", value="https://cdn.test/motion.mp4"
+        ),
+        ReferenceAsset(
+            kind="audio", source="url", value="https://cdn.test/voice.mp3"
+        ),
+    ]
+    with (
+        patch.object(
+            seedance25.client.requests, "post", return_value=_response({"id": "t"})
+        ) as post,
+        patch.object(
+            seedance25.polling.requests, "get", return_value=_completed_task()
+        ),
+        patch.object(seedance25.polling.time, "sleep"),
+    ):
+        items = seedance25.generate_videos(
+            "a cinematic product reveal",
+            minimum_duration=5,
+            reference_assets=assets,
+            omni_reference_task_type="auto",
+        )
+
+    content = post.call_args.kwargs["json"]["content"]
+    assert content == [
+        {"type": "text", "text": "a cinematic product reveal"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "https://img.test/style.png"},
+            "role": "reference_image",
+        },
+        {
+            "type": "video_url",
+            "video_url": {"url": "https://cdn.test/motion.mp4"},
+            "role": "reference_video",
+        },
+        {
+            "type": "audio_url",
+            "audio_url": {"url": "https://cdn.test/voice.mp3"},
+            "role": "reference_audio",
+        },
+    ]
+    assert items[0].source_info["reference_asset_kinds"] == [
+        "image",
+        "video",
+        "audio",
+    ]
+    assert post.call_args.kwargs["json"]["omni_reference_task_type"] == (
+        "auto"
+    )
+
+
+def test_image_reference_can_generate_without_text_prompt():
+    asset = ReferenceAsset(
+        kind="image", source="url", value="https://img.test/subject.png"
+    )
+    with (
+        patch.object(
+            seedance25.client.requests, "post", return_value=_response({"id": "t"})
+        ) as post,
+        patch.object(
+            seedance25.polling.requests, "get", return_value=_completed_task()
+        ),
+        patch.object(seedance25.polling.time, "sleep"),
+    ):
+        seedance25.generate_videos(
+            "", minimum_duration=5, reference_assets=[asset]
+        )
+
+    assert post.call_args.kwargs["json"]["content"] == [
+        {
+            "type": "image_url",
+            "image_url": {"url": "https://img.test/subject.png"},
+            "role": "reference_image",
+        }
+    ]
+
+
+def test_audio_reference_can_generate_without_text_prompt():
+    audio = ReferenceAsset(
+        kind="audio", source="url", value="https://cdn.test/voice.mp3"
+    )
+    with (
+        patch.object(
+            seedance25.client.requests, "post", return_value=_response({"id": "t"})
+        ) as post,
+        patch.object(
+            seedance25.polling.requests, "get", return_value=_completed_task()
+        ),
+        patch.object(seedance25.polling.time, "sleep"),
+    ):
+        seedance25.generate_videos("", minimum_duration=5, reference_assets=[audio])
+
+    assert post.call_args.kwargs["json"]["content"] == [
+        {
+            "type": "audio_url",
+            "audio_url": {"url": "https://cdn.test/voice.mp3"},
+            "role": "reference_audio",
+        }
+    ]
+
+
+def test_local_audio_reference_is_encoded_as_a_data_url(tmp_path):
+    audio_path = tmp_path / "voice.mp3"
+    raw = b"fake mp3 bytes"
+    audio_path.write_bytes(raw)
+    audio = ReferenceAsset(
+        kind="audio", source="local_path", value=str(audio_path), mime="audio/mpeg"
+    )
+    with (
+        patch.object(
+            seedance25.client.requests, "post", return_value=_response({"id": "t"})
+        ) as post,
+        patch.object(
+            seedance25.polling.requests, "get", return_value=_completed_task()
+        ),
+        patch.object(seedance25.polling.time, "sleep"),
+    ):
+        seedance25.generate_videos("", minimum_duration=-1, reference_assets=[audio])
+
+    payload = post.call_args.kwargs["json"]
+    url = payload["content"][0]["audio_url"]["url"]
+    assert url.startswith("data:audio/mpeg;base64,")
+    assert base64.b64decode(url.split(",", 1)[1]) == raw
+    assert payload["duration"] == -1
+    assert payload["omni_reference_task_type"] == "auto"
+
+
+def test_omni_reference_task_type_without_reference_asset_is_rejected():
+    with patch.object(seedance25.client.requests, "post") as post:
+        with pytest.raises(seedance25.Seedance25Error, match="requires at least"):
+            seedance25.generate_videos(
+                "x", minimum_duration=5, omni_reference_task_type="edit"
+            )
+    post.assert_not_called()
+
+
+def test_edit_and_extend_task_types_enforce_documented_constraints():
+    video = ReferenceAsset(
+        kind="video", source="url", value="https://cdn.test/source.mp4"
+    )
+    with patch.object(seedance25.client.requests, "post") as post:
+        with pytest.raises(seedance25.Seedance25Error, match="ratio='adaptive'"):
+            seedance25.generate_videos(
+                "edit this video",
+                minimum_duration=-1,
+                reference_assets=[video],
+                omni_reference_task_type="edit",
+            )
+        with pytest.raises(seedance25.Seedance25Error, match="duration=-1"):
+            seedance25.generate_videos(
+                "edit this video",
+                minimum_duration=5,
+                video_aspect=VideoAspect.adaptive,
+                reference_assets=[video],
+                omni_reference_task_type="edit",
+            )
+        with pytest.raises(seedance25.Seedance25Error, match="reference_video"):
+            seedance25.generate_videos(
+                "extend this",
+                minimum_duration=5,
+                video_aspect=VideoAspect.adaptive,
+                reference_assets=[
+                    ReferenceAsset(
+                        kind="audio",
+                        source="url",
+                        value="https://cdn.test/voice.mp3",
+                    )
+                ],
+                omni_reference_task_type="extend",
+            )
     post.assert_not_called()
 
 

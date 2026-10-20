@@ -8,7 +8,7 @@
 差异集中在请求参数与能力上：
 
 * **时长上限** 30 秒（1.0 Pro 为 12 秒），取值 ``[4, 30]`` 或 ``-1``（自动）。
-* **分辨率** 多出 ``4k``。
+* **分辨率** 支持 ``480p``、``720p``、``1080p``。
 * **图生视频（i2v）** ``content`` 内追加
   ``{"type": "image_url", "image_url": {"url": ...}, "role": "first_frame"}``，
   且此时 ``ratio`` **必须**为 ``adaptive``（由方舟强制，传入具体比例会报错）。
@@ -23,7 +23,7 @@ from __future__ import annotations
 import base64
 import mimetypes
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +37,11 @@ from app.services.video_providers.errors import (
     VideoProviderError,
     VideoProviderUnconfirmedTaskError,
 )
-from app.services.video_providers.spec import FirstFrame, VideoProviderSpec
+from app.services.video_providers.spec import (
+    FirstFrame,
+    ReferenceAsset,
+    VideoProviderSpec,
+)
 
 
 DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
@@ -59,12 +63,16 @@ TERMINAL_FAILURE_STATUSES = frozenset(
 )
 ACTIVE_STATUSES = frozenset({"queued", "running"})
 SUCCESS_STATUSES = frozenset({"succeeded"})
-SUPPORTED_RESOLUTIONS = frozenset({"480p", "720p", "1080p", "4k"})
+SUPPORTED_RESOLUTIONS = frozenset({"480p", "720p", "1080p"})
 # 图生视频时方舟要求 ratio 必须为 adaptive（自动跟随首帧宽高比）。
 ADAPTIVE_RATIO = "adaptive"
-# 单张首帧图片的最大字节数。文档未给出硬上限，这里取一个保守值，
-# 避免把超大图片编码进请求体导致提交被拒或超时。
-MAX_FIRST_FRAME_BYTES = 10 * 1024 * 1024
+# 官方限制单张图片小于 30 MB；超大文件应使用 URL 或素材 ID，避免请求体超过
+# 64 MB。
+MAX_FIRST_FRAME_BYTES = 30 * 1024 * 1024
+# 官方限制：图片小于 30 MB、音频小于 15 MB。视频不能用 Base64 提交。
+MAX_REFERENCE_IMAGE_BYTES = MAX_FIRST_FRAME_BYTES
+MAX_REFERENCE_AUDIO_BYTES = 15 * 1024 * 1024
+VALID_OMNI_REFERENCE_TASK_TYPES = frozenset({"auto", "edit", "extend"})
 
 
 class Seedance25Error(VideoProviderError):
@@ -90,9 +98,13 @@ SPEC = VideoProviderSpec(
     legacy_module="",
     group="ai_video",
     requires_charge_confirmation=True,
-    # Seedance 2.5 原生支持首帧图生视频与带声音视频。
+    # Seedance 2.5 原生支持首帧图生视频、带声音视频，以及全模态参考素材
+    # （reference_image / reference_video / reference_audio 可混合传入）。
     supports_image_to_video=True,
     supports_native_audio=True,
+    supports_reference_assets=True,
+    # 方舟允许 duration=-1，表示依据输入素材自动适配时长（edit 任务强制如此）。
+    supports_auto_duration=True,
     measure_downloaded_duration=False,
     remote_task_id_attr="task_id",
     error_details_key="seedance25_task_id",
@@ -208,17 +220,38 @@ def _response_error(response: Any, api_key: str) -> str:
 def _rendition_size(aspect: VideoAspect, resolution: str) -> tuple[int, int]:
     """按输出规格与画幅推算记录用的像素尺寸。
 
-    分辨率名称只承诺短边规格（480/720/1080）与 16:9 长边；本项目只生成
-    9:16 / 16:9 / 1:1 三种画幅，因此用与 Seedance 1.0 相同的对齐口径，
-    避免审计时看到与文件不一致的尺寸。4k 按 3840 长边记录。
+    使用官方文档列出的输出像素规格；adaptive 由模型根据参考素材决定，
+    提交前无法可靠推导尺寸，故记录为 0×0。
     """
-    short_edge = {"480p": 480, "720p": 720, "1080p": 1080, "4k": 2160}[resolution]
-    long_edge = {"480p": 864, "720p": 1280, "1080p": 1920, "4k": 3840}[resolution]
-    if aspect == VideoAspect.portrait:
-        return short_edge, long_edge
-    if aspect == VideoAspect.square:
-        return short_edge, short_edge
-    return long_edge, short_edge
+    if aspect == VideoAspect.adaptive:
+        return 0, 0
+    sizes = {
+        "480p": {
+            VideoAspect.landscape: (854, 480),
+            VideoAspect.landscape_4_3: (752, 560),
+            VideoAspect.square: (640, 640),
+            VideoAspect.portrait_3_4: (560, 752),
+            VideoAspect.portrait: (480, 854),
+            VideoAspect.cinematic: (992, 432),
+        },
+        "720p": {
+            VideoAspect.landscape: (1280, 720),
+            VideoAspect.landscape_4_3: (1112, 834),
+            VideoAspect.square: (960, 960),
+            VideoAspect.portrait_3_4: (834, 1112),
+            VideoAspect.portrait: (720, 1280),
+            VideoAspect.cinematic: (1470, 630),
+        },
+        "1080p": {
+            VideoAspect.landscape: (1920, 1080),
+            VideoAspect.landscape_4_3: (1664, 1248),
+            VideoAspect.square: (1440, 1440),
+            VideoAspect.portrait_3_4: (1248, 1664),
+            VideoAspect.portrait: (1080, 1920),
+            VideoAspect.cinematic: (2206, 946),
+        },
+    }
+    return sizes[resolution][aspect]
 
 
 def _encode_first_frame(first_frame: FirstFrame) -> str:
@@ -226,14 +259,13 @@ def _encode_first_frame(first_frame: FirstFrame) -> str:
 
     * ``url`` —— 公网可访问的图片地址，直接提交。
     * ``local_path`` —— 本地文件读成 base64 data URL（方舟同时接受这种形态）。
-    * ``asset_id`` —— 方舟图生视频不接受素材 ID，必须显式拒绝而不是静默丢弃。
+    * ``asset_id`` —— 方舟素材库中的图片素材 ID，直接提交。
     """
-    if first_frame.kind == "url":
+    if first_frame.kind in {"url", "asset_id"}:
         return first_frame.value
-
     if first_frame.kind != "local_path":
         raise Seedance25Error(
-            "Seedance 2.5 image-to-video accepts a public image URL or a local "
+            "Seedance 2.5 image-to-video accepts a URL, asset ID, or local "
             f"file, not {first_frame.kind!r}"
         )
 
@@ -261,9 +293,75 @@ def _encode_first_frame(first_frame: FirstFrame) -> str:
     return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
 
 
-def _build_content(term: str, first_frame: FirstFrame | None) -> list[dict[str, Any]]:
-    """构造方舟的 ``content`` 数组：文本提示词，可选首帧图。"""
-    content: list[dict[str, Any]] = [{"type": "text", "text": term}]
+# 每条参考素材在 content 里对应的 type 与 role。方舟用 role 区分用途：
+# reference_image 提供外观/角色/商品/场景/风格，reference_video 提供动作、
+# 运镜与表演，reference_audio 提供音色与节奏。
+_REFERENCE_ROLES: dict[str, tuple[str, str]] = {
+    "image": ("image_url", "reference_image"),
+    "video": ("video_url", "reference_video"),
+    "audio": ("audio_url", "reference_audio"),
+}
+
+# 单次请求的参考素材上限（官方：≤30 图、≤10 视频、≤10 音频）。
+MAX_REFERENCE_COUNTS: dict[str, int] = {"image": 30, "video": 10, "audio": 10}
+
+
+def _encode_reference_asset(asset: ReferenceAsset) -> str:
+    """把参考素材转成方舟接受的地址形态。
+
+    音频与视频通常体积较大，走 base64 data URL 会让请求体膨胀到不可用的
+    量级；因此只有图片支持本地路径（内联为 data URL），视频与音频必须是
+    公网可访问的 URL。
+    """
+    if asset.source in {"url", "asset_id"}:
+        return asset.value
+
+    if asset.kind == "video":
+        raise Seedance25Error(
+            "Seedance 2.5 requires a public URL or asset ID for video reference "
+            "assets; local video files are not supported"
+        )
+
+    path = Path(asset.value)
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise Seedance25Error(f"reference {asset.kind} is not readable: {path}") from exc
+    if size <= 0:
+        raise Seedance25Error(f"reference {asset.kind} is empty: {path}")
+    limit = (
+        MAX_REFERENCE_IMAGE_BYTES
+        if asset.kind == "image"
+        else MAX_REFERENCE_AUDIO_BYTES
+    )
+    if size > limit:
+        raise Seedance25Error(
+            f"reference {asset.kind} exceeds {limit} bytes: {path}"
+        )
+    default_mime = "image/png" if asset.kind == "image" else "audio/mpeg"
+    mime = asset.mime or mimetypes.guess_type(path.name)[0] or default_mime
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise Seedance25Error(f"reference {asset.kind} could not be read: {path}") from exc
+    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+
+def _build_content(
+    term: str,
+    first_frame: FirstFrame | None,
+    reference_assets: Sequence[ReferenceAsset] | None = None,
+) -> list[dict[str, Any]]:
+    """构造方舟的 ``content`` 数组。
+
+    顺序是「文本 → 首帧 → 参考素材」。首帧（first_frame）与参考图
+    （reference_image）语义不同：前者决定视频从哪里开始，后者是"照着这个
+    外观/风格/动作生成"。两者可以同时存在。
+    """
+    content: list[dict[str, Any]] = []
+    if term:
+        content.append({"type": "text", "text": term})
+
     if first_frame is not None:
         content.append(
             {
@@ -272,6 +370,32 @@ def _build_content(term: str, first_frame: FirstFrame | None) -> list[dict[str, 
                 "role": "first_frame",
             }
         )
+
+    assets = list(reference_assets or ())
+    if assets:
+        counts: dict[str, int] = {}
+        for asset in assets:
+            counts[asset.kind] = counts.get(asset.kind, 0) + 1
+        for kind, count in counts.items():
+            limit = MAX_REFERENCE_COUNTS.get(kind, 0)
+            if count > limit:
+                raise Seedance25Error(
+                    f"too many {kind} reference assets: {count} > {limit}"
+                )
+        for asset in assets:
+            if asset.kind not in _REFERENCE_ROLES:
+                raise Seedance25Error(
+                    f"unsupported Seedance 2.5 reference asset kind: {asset.kind!r}"
+                )
+            type_name, role = _REFERENCE_ROLES[asset.kind]
+            content.append(
+                {
+                    "type": type_name,
+                    type_name: {"url": _encode_reference_asset(asset)},
+                    "role": role,
+                }
+            )
+
     return content
 
 
@@ -280,6 +404,8 @@ def generate_videos(
     minimum_duration: int,
     video_aspect: VideoAspect = VideoAspect.portrait,
     first_frame: FirstFrame | None = None,
+    reference_assets: Sequence[ReferenceAsset] | None = None,
+    omni_reference_task_type: str = "",
 ) -> list[MaterialInfo]:
     """提交一个 Seedance 2.5 任务，并等待可下载的结果地址。
 
@@ -291,33 +417,75 @@ def generate_videos(
         raise Seedance25Error("Volcano Engine Seedance 2.5 requires an Ark API key")
 
     term = str(search_term or "").strip()
-    if not term:
+    assets = list(reference_assets or ())
+    reference_task_type = str(omni_reference_task_type or "").strip().lower()
+    # 全模态参考任务由任一种 reference_image / reference_video /
+    # reference_audio 触发，因此参考音频可以作为唯一素材。
+    has_reference_input = first_frame is not None or bool(assets)
+    if not term and not has_reference_input:
         # 空提示词通常来自上游脚本拆分异常。付费生成源不能把无效输入提交到
         # 远端，否则即使接口接受也只会得到无法使用且已计费的视频。
-        raise Seedance25Error("Seedance 2.5 search term must not be empty")
+        raise Seedance25Error(
+            "Seedance 2.5 search term must not be empty unless an image or "
+            "video/audio reference asset is supplied"
+        )
+    if assets and not reference_task_type:
+        # 官方推荐显式传 auto，令服务端按提示词识别参考生成、编辑或延长。
+        reference_task_type = "auto"
+    if reference_task_type not in {"", *VALID_OMNI_REFERENCE_TASK_TYPES}:
+        choices = ", ".join(sorted(VALID_OMNI_REFERENCE_TASK_TYPES))
+        raise Seedance25Error(
+            f"unsupported omni_reference_task_type {reference_task_type!r}; "
+            f"expected one of: {choices}"
+        )
+    if reference_task_type and not assets:
+        raise Seedance25Error(
+            "omni_reference_task_type requires at least one reference asset"
+        )
 
     aspect = VideoAspect(video_aspect)
     try:
-        requested_duration = max(int(minimum_duration), 1)
+        requested_duration = int(minimum_duration)
     except (TypeError, ValueError, OverflowError) as exc:
         raise Seedance25Error(
-            "Seedance 2.5 clip duration must be a positive integer"
+            "Seedance 2.5 clip duration must be -1 or a positive integer"
         ) from exc
-    minimum, maximum = _duration_bounds()
-    duration = min(max(requested_duration, minimum), maximum)
+    if requested_duration == -1:
+        duration = -1
+    elif requested_duration <= 0:
+        raise Seedance25Error(
+            "Seedance 2.5 clip duration must be -1 or a positive integer"
+        )
+    else:
+        minimum, maximum = _duration_bounds()
+        duration = min(max(requested_duration, minimum), maximum)
     if duration != requested_duration:
         logger.info(
             "Seedance 2.5 clip duration clamped to the configured model range: "
-            f"requested={requested_duration}s, using={duration}s "
-            f"(configured {minimum}-{maximum}s)"
+            f"requested={requested_duration}s, using={duration}s"
         )
 
     resolution = _resolution()
+    has_reference_video = any(asset.kind == "video" for asset in assets)
+    if reference_task_type in {"edit", "extend"} and not has_reference_video:
+        raise Seedance25Error(
+            f"omni_reference_task_type={reference_task_type!r} requires at "
+            "least one reference_video asset"
+        )
+    if reference_task_type in {"edit", "extend"} and aspect != VideoAspect.adaptive:
+        raise Seedance25Error(
+            f"omni_reference_task_type={reference_task_type!r} requires "
+            "ratio='adaptive'"
+        )
+    if reference_task_type == "edit" and duration != -1:
+        raise Seedance25Error(
+            "omni_reference_task_type='edit' requires duration=-1"
+        )
     # 图生视频必须用 adaptive，否则方舟会拒绝请求。
     ratio = ADAPTIVE_RATIO if first_frame is not None else aspect.value
     payload: dict[str, Any] = {
         "model": _model_id(),
-        "content": _build_content(term, first_frame),
+        "content": _build_content(term, first_frame, assets),
         "ratio": ratio,
         "duration": duration,
         "resolution": resolution,
@@ -327,6 +495,9 @@ def generate_videos(
     # 主要理由；成片是否真正混入该音轨由剪辑阶段决定。
     if _config_bool("seedance25_generate_audio", True):
         payload["generate_audio"] = True
+    if reference_task_type:
+        # 方舟根据该值提前判定参考生视频/视频编辑/视频延长任务类型。
+        payload["omni_reference_task_type"] = reference_task_type
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -337,6 +508,8 @@ def generate_videos(
         "generating video with Volcano Engine Seedance 2.5: "
         f"model={payload['model']}, duration={duration}s, ratio={ratio}, "
         f"resolution={resolution}, image_to_video={first_frame is not None}, "
+        f"references={len(assets)}, "
+        f"reference_task_type={reference_task_type or 'auto'}, "
         f"prompt_length={len(term)}"
     )
 
@@ -378,6 +551,10 @@ def generate_videos(
         # 记录首帧来源，便于审计"这一段的画面是从哪张图接下去的"。
         source_info["first_frame_kind"] = first_frame.kind
         source_info["first_frame_origin"] = first_frame.origin
+    if assets:
+        source_info["reference_asset_count"] = len(assets)
+        source_info["reference_asset_kinds"] = [asset.kind for asset in assets]
+        source_info["omni_reference_task_type"] = reference_task_type
 
     return [
         MaterialInfo(

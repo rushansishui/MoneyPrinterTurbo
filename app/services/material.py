@@ -70,6 +70,13 @@ from app.services.video_providers.sources.wavespeed import (  # noqa: F401
 _api_key_counter = 0
 _api_key_lock = threading.Lock()
 
+# 同名素材的并发下载合并。缓存命中只检查"文件存在且非空"，两个并发任务
+# 同时未命中时会各自完整下载一份同样的 200MB 素材（云端多 worker、或同一
+# 任务里多个搜索词命中同一 URL）。这里按目标文件路径做 single-flight：
+# 后到者等第一个下载完成后直接复用结果，不再重复消耗带宽与第三方配额。
+_download_locks_guard = threading.Lock()
+_download_locks: dict[str, threading.Lock] = {}
+
 # A provider URL can point to an unexpectedly large object or never-ending stream.
 # Short stock and generated clips should stay well below this conservative cap.
 MAX_VIDEO_DOWNLOAD_BYTES = 512 * 1024 * 1024
@@ -318,6 +325,10 @@ def _matches_video_aspect(
     Pexels、Pixabay 和 Coverr 的响应字段并不统一，因此先使用宽高做可靠判断；
     Coverr 部分历史响应缺少尺寸时，再使用明确的 ``is_vertical`` 布尔值兜底。
     无法确认方向的素材直接跳过，避免竖屏任务混入横屏素材并在成片中产生黑边。
+
+    判定只区分横/竖/方三个方向，而不是精确比较宽高比：4:3、3:4、21:9 这类
+    画幅在库存源里几乎没有原生素材，精确比较会让候选集直接为空；交给合成
+    阶段的 cover/contain 裁剪即可。
     """
     aspect = VideoAspect(video_aspect)
     try:
@@ -328,14 +339,21 @@ def _matches_video_aspect(
         normalized_height = 0
 
     if normalized_width > 0 and normalized_height > 0:
-        if aspect == VideoAspect.portrait:
+        if aspect.is_portrait:
             return normalized_height > normalized_width
-        if aspect == VideoAspect.landscape:
+        if aspect.is_landscape:
             return normalized_width > normalized_height
-        return normalized_width == normalized_height
+        if aspect.is_square:
+            return normalized_width == normalized_height
+        # adaptive 没有确定方向，接受任意候选。
+        return True
 
-    if isinstance(is_vertical, bool) and aspect != VideoAspect.square:
-        return is_vertical == (aspect == VideoAspect.portrait)
+    if isinstance(is_vertical, bool) and not aspect.is_square:
+        if aspect.is_portrait:
+            return is_vertical
+        if aspect.is_landscape:
+            return not is_vertical
+        return True
     return False
 
 
@@ -384,8 +402,12 @@ def search_videos_pexels(
     }
     # Build URL
     params = {"query": search_term, "per_page": 20}
-    if aspect != VideoAspect.square:
-        params["orientation"] = aspect.name
+    # Pexels 的 orientation 只接受 landscape / portrait / square 三个值。
+    # 4:3、21:9 等横向画幅必须映射成 landscape，否则 API 会拒收参数。
+    if aspect.is_landscape:
+        params["orientation"] = "landscape"
+    elif aspect.is_portrait:
+        params["orientation"] = "portrait"
     query_url = f"https://api.pexels.com/v1/videos/search?{urlencode(params)}"
     logger.info(f"searching videos on pexels: term={search_term!r}")
 
@@ -651,9 +673,9 @@ def search_videos_coverr(
     }
     # 服务端方向筛选可以直接从完整搜索结果中返回目标素材，避免先取热门结果再
     # 本地过滤导致竖屏候选为空。方形素材没有对应布尔条件，继续依赖本地宽高校验。
-    if aspect == VideoAspect.portrait:
+    if aspect.is_portrait:
         params["filter"] = "is_vertical:true"
-    elif aspect == VideoAspect.landscape:
+    elif aspect.is_landscape:
         params["filter"] = "is_vertical:false"
     query_url = f"https://api.coverr.co/videos?{urlencode(params)}"
     logger.info(f"searching videos on coverr: term={search_term!r}")
@@ -819,6 +841,24 @@ def _describe_download_progress(
     return f"{downloaded_mb:.1f} MB, {speed:.2f} MB/s"
 
 
+def _download_lock(video_path: str) -> threading.Lock:
+    """取出（必要时创建）某个缓存文件对应的下载锁。"""
+    with _download_locks_guard:
+        lock = _download_locks.get(video_path)
+        if lock is None:
+            lock = threading.Lock()
+            _download_locks[video_path] = lock
+        return lock
+
+
+def _cached_video_path(video_path: str) -> str:
+    """缓存命中时返回路径，否则返回空串。"""
+    if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
+        logger.info(f"video already exists: {video_path}")
+        return video_path
+    return ""
+
+
 def save_video(video_url: str, save_dir: str = "") -> str:
     if not save_dir:
         save_dir = utils.storage_dir("cache_videos")
@@ -834,10 +874,26 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     video_path = f"{save_dir}/{video_id}.mp4"
 
     # if video already exists, return the path
-    if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
-        logger.info(f"video already exists: {video_path}")
-        return video_path
+    cached = _cached_video_path(video_path)
+    if cached:
+        return cached
 
+    # 同一 URL 的并发下载在这里串行化：后到者阻塞等到第一个下载完成后，
+    # 直接命中上面的缓存检查，而不是重复拉一遍同样的文件。
+    with _download_lock(video_path):
+        cached = _cached_video_path(video_path)
+        if cached:
+            return cached
+        return _download_video_to_cache(video_url, video_id, video_path, save_dir)
+
+
+def _download_video_to_cache(
+    video_url: str, video_id: str, video_path: str, save_dir: str
+) -> str:
+    """下载并校验一个素材，成功时原子发布到 ``video_path``。
+
+    调用方必须已持有该路径的下载锁，否则并发写会互相覆盖临时状态。
+    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
     }

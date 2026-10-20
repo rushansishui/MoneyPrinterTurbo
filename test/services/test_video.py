@@ -597,8 +597,8 @@ class TestVideoService(unittest.TestCase):
             self.assertEqual(Path(first).read_bytes(), b"duration=4")
             self.assertEqual(Path(second).read_bytes(), b"duration=7")
 
-    def test_failed_image_zoom_render_preserves_previous_complete_clip(self):
-        """A failed rerender must leave the last verified MP4 available."""
+    def test_image_zoom_render_reuses_complete_output(self):
+        """相同输入（源图 + 时长）的第二次渲染直接复用已发布文件。"""
         class FakeImageClip:
             mask = None
 
@@ -629,9 +629,7 @@ class TestVideoService(unittest.TestCase):
             def write_videofile(self, output, **_kwargs):
                 nonlocal writes
                 writes += 1
-                Path(output).write_bytes(b"complete" if writes == 1 else b"partial")
-                if writes == 2:
-                    raise RuntimeError("render interrupted")
+                Path(output).write_bytes(b"complete")
 
         with tempfile.TemporaryDirectory() as temp_dir:
             image_path = os.path.join(temp_dir, "image.png")
@@ -639,14 +637,57 @@ class TestVideoService(unittest.TestCase):
                 patch.object(vd, "ImageClip", FakeImageClip),
                 patch.object(vd, "CompositeVideoClip", FakeCompositeClip),
             ):
-                output = vd.render_image_zoom_video(image_path, clip_duration=5)
+                first = vd.render_image_zoom_video(image_path, clip_duration=5)
+                second = vd.render_image_zoom_video(image_path, clip_duration=5)
+
+            self.assertEqual(first, second)
+            # 输出文件名由「源图身份 + 时长」决定，第二次调用不应重新编码。
+            self.assertEqual(writes, 1)
+            self.assertEqual(Path(first).read_bytes(), b"complete")
+
+    def test_failed_image_zoom_render_does_not_publish_partial_output(self):
+        """编码中途失败时不能把半成品发布成正式产物。"""
+        class FakeImageClip:
+            mask = None
+
+            def get_frame(self, _time):
+                return np.zeros((2, 2, 3), dtype=np.uint8)
+
+            duration = 0
+
+            def __init__(self, _path):
+                pass
+
+            def with_duration(self, duration):
+                self.duration = duration
+                return self
+
+            def with_position(self, _position):
+                return self
+
+            def resized(self, _scale):
+                return self
+
+        class FakeCompositeClip:
+            def __init__(self, _clips, bg_color=None):
+                pass
+
+            def write_videofile(self, output, **_kwargs):
+                Path(output).write_bytes(b"partial")
+                raise RuntimeError("render interrupted")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = os.path.join(temp_dir, "image.png")
+            with (
+                patch.object(vd, "ImageClip", FakeImageClip),
+                patch.object(vd, "CompositeVideoClip", FakeCompositeClip),
+            ):
                 with self.assertRaisesRegex(RuntimeError, "render interrupted"):
                     vd.render_image_zoom_video(image_path, clip_duration=5)
 
-            self.assertEqual(Path(output).read_bytes(), b"complete")
+            # 临时文件必须被清理，目录里不能留下任何 .mp4。
             self.assertEqual(
-                sorted(path.name for path in Path(temp_dir).iterdir()),
-                [Path(output).name],
+                [path.name for path in Path(temp_dir).glob("*.mp4")], []
             )
 
     def test_preprocess_video_rejects_material_outside_local_videos(self):

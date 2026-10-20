@@ -16,7 +16,9 @@ def test_actual_process_start_failure_records_terminal_manifest(tmp_path):
     with patch.object(agent.shutil, "which", return_value=missing_executable), patch.object(agent, "run_checked"):
         with pytest.raises((OSError, agent.SkillError)):
             agent.generate_video(tmp_path, "fixture subject", [])
-    payload = json.loads(agent.result_manifest_path(tmp_path).read_text())
+    payload = json.loads(
+        agent.result_manifest_path(tmp_path).read_text(encoding="utf-8")
+    )
     assert payload["status"] == "failed"
     assert payload["video_files"] == []
     assert payload["task_id"] and payload["log_file"]

@@ -555,7 +555,16 @@ def save_config():
     主要用于避免多标签页或快速 rerun 时损坏配置文件。
     """
     with _config_save_lock:
-        config_to_save = dict(_cfg)
+        # 以磁盘上的当前内容为基准，只覆盖本模块实际管理的分区。
+        # 之前直接用导入期的 ``_cfg`` 快照重写整个文件：用户在两次保存之间
+        # 手工编辑的 whisper / proxy 等分区会被静默回滚到启动时的旧值，而且
+        # 没有任何日志提示。
+        try:
+            config_to_save = _load_toml_config(config_file)
+        except (OSError, UnicodeError, ValueError, toml.TomlDecodeError):
+            # 文件暂时不可读或内容损坏：退回内存快照，至少不丢受管字段。
+            config_to_save = dict(_cfg)
+
         config_to_save["app"] = dict(app)
         config_to_save["azure"] = dict(azure)
         config_to_save["siliconflow"] = dict(siliconflow)
@@ -566,6 +575,9 @@ def save_config():
         config_to_save["fish_audio"] = dict(fish_audio)
         config_to_save["voxcpm"] = dict(voxcpm)
         config_to_save["ui"] = dict(ui)
+        # whisper / proxy 在运行期只被读取，没有任何代码修改它们，因此以磁盘
+        # 内容为准。若把它们也写成内存快照，用户手工编辑的 model_size 或代理
+        # 设置会在下一次保存时被回滚——这正是本次修复要消除的问题。
         serialized_config = toml.dumps(config_to_save)
 
         # WebUI 完整 rerun 结束时会调用保存。内容没有变化时直接返回，避免每次
@@ -634,7 +646,26 @@ ui = _SynchronizedConfig(
 
 hostname = socket.gethostname()
 
-log_level = _cfg.get("log_level", "DEBUG")
+_LOG_LEVELS = frozenset(
+    {"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"}
+)
+
+
+def _normalize_log_level(value) -> str:
+    """把配置里的日志级别归一化成 loguru 认识的大写名。
+
+    loguru 的 ``level=`` 只接受精确匹配的大写名称，用户在 config.toml 里写成
+    ``"info"``（Python 的常见写法）会让 ``import app.config`` 直接抛
+    ``ValueError``，表现为进程启动即崩且 traceback 指向 loguru 而非配置项。
+    """
+    level = str(value or "DEBUG").strip().upper()
+    if level in _LOG_LEVELS:
+        return level
+    logger.warning(f"invalid log_level {value!r}, falling back to DEBUG")
+    return "DEBUG"
+
+
+log_level = _normalize_log_level(_cfg.get("log_level", "DEBUG"))
 listen_host = _cfg.get("listen_host", "0.0.0.0")
 listen_port = _cfg.get("listen_port", 8080)
 project_name = _cfg.get("project_name", "MoneyPrinterTurbo")

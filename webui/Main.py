@@ -142,6 +142,11 @@ VIDEO_SOURCE_GROUPS = {
     "ai_image": ("openai_image",),
     "local": ("local",),
 }
+# 提交前校验用的全集。从分组派生，新增来源时只需改上面一处，避免出现
+# 「界面上能选、提交时被判非法」这类静默死路。
+_ALL_VIDEO_SOURCES = frozenset(
+    source for group in VIDEO_SOURCE_GROUPS.values() for source in group
+)
 # Upload-Post 的 API Key 与发布用户分别在两个页面管理，并且发布用户名称
 # 不等于登录邮箱。集中维护入口可以避免多语言文案各自硬编码 URL 后发生偏差，
 # 也方便用户从 WebUI 直接完成首次配置和后续账号维护。
@@ -612,6 +617,59 @@ def _build_uploaded_file_path(uploaded_file, target_dir, allowed_extensions, pre
         logger.warning(f"invalid uploaded file path: {file_path}")
         raise ValueError("invalid uploaded file path")
     return file_path
+
+
+class _UploadTooLargeError(ValueError):
+    """上传体积超过 provider 限额。
+
+    与「类型不支持 / 文件为空」区分开：调用方需要给出不同的用户提示，不能
+    把格式错误也报成「文件过大」。
+    """
+
+
+def _stage_ai_video_upload(
+    uploaded_file, target_dir, allowed_extensions, prefix, max_bytes=None
+):
+    """Stage an AI-video upload once per content hash across Streamlit reruns.
+
+    超过 ``max_bytes`` 的文件在落盘前就被拒绝：上传体积是 provider 的硬限制，
+    写进磁盘再报错只会给用户留下无法使用的垃圾文件。
+    """
+    original_name = os.path.basename(str(uploaded_file.name or ""))
+    extension = os.path.splitext(original_name)[1].lower()
+    if extension not in allowed_extensions:
+        raise ValueError("unsupported uploaded file type")
+
+    raw = bytes(uploaded_file.getbuffer())
+    if not raw:
+        raise ValueError("uploaded file is empty")
+    if max_bytes is not None and len(raw) > max_bytes:
+        raise _UploadTooLargeError(
+            f"uploaded file exceeds the provider size limit: {len(raw)} > {max_bytes}"
+        )
+    digest = hashlib.sha256(raw).hexdigest()
+    normalized_target_dir = os.path.realpath(target_dir)
+    os.makedirs(normalized_target_dir, exist_ok=True)
+    file_path = os.path.realpath(
+        os.path.join(normalized_target_dir, f"{prefix}-{digest}{extension}")
+    )
+    if os.path.commonpath([normalized_target_dir, file_path]) != normalized_target_dir:
+        raise ValueError("invalid uploaded file path")
+    if not os.path.isfile(file_path):
+        with open(file_path, "wb") as handle:
+            handle.write(raw)
+    return file_path, len(raw)
+
+
+def _cleanup_ai_video_uploads(target_dir, max_age_seconds=24 * 60 * 60):
+    """Opportunistically remove stale staged AI-video uploads."""
+    cutoff = time.time() - max_age_seconds
+    try:
+        for entry in Path(target_dir).iterdir():
+            if entry.is_file() and entry.stat().st_mtime < cutoff:
+                entry.unlink()
+    except OSError as exc:
+        logger.debug(f"failed to clean AI video uploads: {target_dir}: {exc}")
 
 
 def _save_uploaded_local_materials(uploaded_files):
@@ -1768,35 +1826,81 @@ def _render_ai_video_studio_dialog():
     )
     selected = next(item for item in options if item["provider_id"] == provider_id)
 
+    # 切换 provider 时清理上一个 provider 的专属控件状态，避免例如
+    # Seedance 的 adaptive / -1 被带到不支持它们的 provider。
+    provider_state_key = "ai_video_studio_last_provider"
+    if st.session_state.get(provider_state_key) != provider_id:
+        st.session_state[provider_state_key] = provider_id
+        st.session_state["ai_video_studio_aspect"] = (
+            "adaptive" if selected.get("supports_reference_assets") else "9:16"
+        )
+        st.session_state["ai_video_studio_duration"] = (
+            -1 if selected.get("supports_auto_duration") else 5
+        )
+
     prompt = st.text_area(
         tr("AI Video Prompt"),
         key="ai_video_studio_prompt",
         height=120,
         help=tr("AI Video Prompt Help"),
     )
-    duration = st.number_input(
-        tr("AI Video Duration"),
-        min_value=1,
-        max_value=60,
-        value=5,
-        step=1,
-        key="ai_video_studio_duration",
-    )
-    aspect_label = st.selectbox(
-        tr("Video Ratio"),
-        options=[
-            tr("Portrait"),
-            tr("Landscape"),
-            tr("Square"),
-        ],
-        key="ai_video_studio_aspect",
-    )
-    aspect = {
-        tr("Portrait"): "9:16",
-        tr("Landscape"): "16:9",
-        tr("Square"): "1:1",
-    }[aspect_label]
+    reference_task_type = ""
+    if selected.get("supports_reference_assets"):
+        reference_task_type = st.selectbox(
+            tr("Omni Reference Task Type"),
+            options=["auto", "edit", "extend"],
+            key="ai_video_studio_omni_reference_task_type",
+            help=tr("Omni Reference Task Type Help"),
+        )
 
+        if reference_task_type in {"edit", "extend"}:
+            # 这两个任务类型都要求 adaptive；edit 还强制自动时长。控件使用
+            # 内部值（"adaptive"）而不是本地化标签，因此这里写 session_state
+            # 才能真正生效。
+            st.session_state["ai_video_studio_aspect"] = "adaptive"
+        if reference_task_type == "edit":
+            st.session_state["ai_video_studio_duration"] = -1
+
+    # 后端会以 400 拒绝非 adaptive / 非 -1 的 edit、extend 请求，所以这里直接
+    # 锁定控件，避免用户以为可以改。
+    aspect_forced = reference_task_type in {"edit", "extend"}
+    duration_forced = reference_task_type == "edit"
+
+    duration_col, aspect_col = st.columns(2, gap="medium")
+    with duration_col:
+        st.session_state.setdefault("ai_video_studio_duration", 5)
+        duration = st.number_input(
+            tr("AI Video Duration"),
+            min_value=-1 if selected.get("supports_auto_duration") else 1,
+            max_value=60,
+            step=1,
+            key="ai_video_studio_duration",
+            disabled=duration_forced,
+        )
+    # options 用内部值、format_func 负责本地化：二者混用会让 session_state
+    # 里写入的内部值匹配不到选项，被 Streamlit 静默忽略。
+    aspect_options = ["9:16", "16:9", "1:1"]
+    if selected.get("supports_reference_assets"):
+        aspect_options.extend(["4:3", "3:4", "21:9", "adaptive"])
+    aspect_labels = {
+        "9:16": tr("Portrait"),
+        "16:9": tr("Landscape"),
+        "1:1": tr("Square"),
+        "adaptive": tr("Adaptive"),
+    }
+    st.session_state.setdefault("ai_video_studio_aspect", aspect_options[0])
+    with aspect_col:
+        aspect = st.selectbox(
+            tr("Video Ratio"),
+            options=aspect_options,
+            format_func=lambda value: aspect_labels.get(value, value),
+            key="ai_video_studio_aspect",
+            disabled=aspect_forced,
+        )
+
+    # 必须在首帧分支之前初始化：首帧上传失败时也会把它置为 False，
+    # 若在这里再无条件赋 True 会把错误状态吞掉，随后照常发起付费请求。
+    reference_upload_valid = True
     first_frame = None
     if selected["supports_image_to_video"]:
         with st.expander(tr("First Frame Image"), expanded=False):
@@ -1813,21 +1917,203 @@ def _render_ai_video_studio_dialog():
         if uploaded_image is not None:
             # 上传的图片先落盘，再以本地路径形式交给 provider 编码成 base64。
             staged_dir = utils.storage_dir("ai_video_first_frames", create=True)
-            suffix = os.path.splitext(uploaded_image.name)[1] or ".png"
-            staged_path = os.path.join(staged_dir, f"{utils.get_uuid()}{suffix}")
-            with open(staged_path, "wb") as handle:
-                handle.write(uploaded_image.getbuffer())
-            first_frame = {
-                "kind": "local_path",
-                "value": staged_path,
-                "origin": "upload",
-            }
+            _cleanup_ai_video_uploads(staged_dir)
+            try:
+                staged_path, _ = _stage_ai_video_upload(
+                    uploaded_image,
+                    staged_dir,
+                    {".png", ".jpg", ".jpeg", ".bmp", ".webp"},
+                    "first-frame",
+                    max_bytes=seedance25.MAX_FIRST_FRAME_BYTES,
+                )
+            except _UploadTooLargeError:
+                reference_upload_valid = False
+                st.error(
+                    tr("Reference File Too Large").format(
+                        name=uploaded_image.name,
+                        limit=seedance25.MAX_FIRST_FRAME_BYTES // (1024 * 1024),
+                        unit="MB",
+                    )
+                )
+            except ValueError as exc:
+                reference_upload_valid = False
+                st.error(f"{uploaded_image.name}: {exc}")
+            else:
+                first_frame = {
+                    "kind": "local_path",
+                    "value": staged_path,
+                    "origin": "upload",
+                }
         elif str(first_frame_url or "").strip():
             first_frame = {
                 "kind": "url",
                 "value": str(first_frame_url).strip(),
                 "origin": "stock",
             }
+
+    reference_assets = []
+    if selected.get("supports_reference_assets"):
+        with st.expander(tr("Reference Assets"), expanded=False):
+            st.caption(tr("Reference Assets Help"))
+            upload_tab, url_tab, asset_tab = st.tabs(
+                [tr("Upload Files"), tr("Public URLs"), tr("Ark Asset IDs")]
+            )
+            with upload_tab:
+                uploaded_reference_images = st.file_uploader(
+                    tr("Reference Image Upload"),
+                    type=["png", "jpg", "jpeg", "bmp", "webp"],
+                    accept_multiple_files=True,
+                    key="ai_video_studio_reference_image_upload",
+                )
+                uploaded_reference_audio = st.file_uploader(
+                    tr("Reference Audio Upload"),
+                    type=["wav", "mp3"],
+                    accept_multiple_files=True,
+                    key="ai_video_studio_reference_audio_upload",
+                )
+                staged_image_dir = utils.storage_dir(
+                    "ai_video_reference_images", create=True
+                )
+                staged_audio_dir = utils.storage_dir(
+                    "ai_video_reference_audio", create=True
+                )
+                _cleanup_ai_video_uploads(staged_image_dir)
+                _cleanup_ai_video_uploads(staged_audio_dir)
+                image_bytes = 0
+                for uploaded_image in uploaded_reference_images or []:
+                    try:
+                        staged_path, size = _stage_ai_video_upload(
+                            uploaded_image,
+                            staged_image_dir,
+                            {".png", ".jpg", ".jpeg", ".bmp", ".webp"},
+                            "reference-image",
+                            max_bytes=seedance25.MAX_REFERENCE_IMAGE_BYTES,
+                        )
+                    except _UploadTooLargeError:
+                        reference_upload_valid = False
+                        st.error(
+                            tr("Reference File Too Large").format(
+                                name=uploaded_image.name,
+                                limit=(
+                                    seedance25.MAX_REFERENCE_IMAGE_BYTES
+                                    // (1024 * 1024)
+                                ),
+                                unit="MB",
+                            )
+                        )
+                        continue
+                    except ValueError as exc:
+                        reference_upload_valid = False
+                        st.error(f"{uploaded_image.name}: {exc}")
+                        continue
+                    image_bytes += size
+                    reference_assets.append(
+                        {
+                            "kind": "image",
+                            "source": "local_path",
+                            "value": staged_path,
+                            "mime": str(uploaded_image.type or ""),
+                        }
+                    )
+                audio_bytes = 0
+                for uploaded_audio in uploaded_reference_audio or []:
+                    try:
+                        staged_path, size = _stage_ai_video_upload(
+                            uploaded_audio,
+                            staged_audio_dir,
+                            {".wav", ".mp3"},
+                            "reference-audio",
+                            max_bytes=seedance25.MAX_REFERENCE_AUDIO_BYTES,
+                        )
+                    except _UploadTooLargeError:
+                        reference_upload_valid = False
+                        st.error(
+                            tr("Reference File Too Large").format(
+                                name=uploaded_audio.name,
+                                limit=(
+                                    seedance25.MAX_REFERENCE_AUDIO_BYTES
+                                    // (1024 * 1024)
+                                ),
+                                unit="MB",
+                            )
+                        )
+                        continue
+                    except ValueError as exc:
+                        reference_upload_valid = False
+                        st.error(f"{uploaded_audio.name}: {exc}")
+                        continue
+                    audio_bytes += size
+                    reference_assets.append(
+                        {
+                            "kind": "audio",
+                            "source": "local_path",
+                            "value": staged_path,
+                            "mime": str(uploaded_audio.type or ""),
+                        }
+                    )
+                if uploaded_reference_images or uploaded_reference_audio:
+                    st.caption(
+                        tr("Uploaded Reference Summary").format(
+                            images=len(uploaded_reference_images or []),
+                            image_mb=image_bytes / 1024 / 1024,
+                            audio=len(uploaded_reference_audio or []),
+                            audio_mb=audio_bytes / 1024 / 1024,
+                        )
+                    )
+
+            with url_tab:
+                for kind, label in (
+                    ("image", tr("Reference Image URLs")),
+                    ("video", tr("Reference Video URLs")),
+                    ("audio", tr("Reference Audio URLs")),
+                ):
+                    urls = st.text_area(
+                        label,
+                        key=f"ai_video_studio_reference_{kind}_urls",
+                        help=tr("Reference URLs Help"),
+                    )
+                    reference_assets.extend(
+                        {
+                            "kind": kind,
+                            "source": "url",
+                            "value": url.strip(),
+                        }
+                        for url in str(urls or "").splitlines()
+                        if url.strip()
+                    )
+
+            with asset_tab:
+                for kind, label in (
+                    ("image", tr("Reference Image Asset IDs")),
+                    ("video", tr("Reference Video Asset IDs")),
+                    ("audio", tr("Reference Audio Asset IDs")),
+                ):
+                    asset_ids = st.text_area(
+                        label,
+                        key=f"ai_video_studio_reference_{kind}_asset_ids",
+                        help=tr("Reference Asset IDs Help"),
+                    )
+                    reference_assets.extend(
+                        {
+                            "kind": kind,
+                            "source": "asset_id",
+                            "value": asset_id.strip(),
+                        }
+                        for asset_id in str(asset_ids or "").splitlines()
+                        if asset_id.strip()
+                    )
+
+            counts = {
+                kind: sum(asset["kind"] == kind for asset in reference_assets)
+                for kind in ("image", "video", "audio")
+            }
+            st.caption(
+                tr("Reference Count Summary").format(
+                    images=counts["image"],
+                    videos=counts["video"],
+                    audio=counts["audio"],
+                )
+            )
 
     st.warning(tr("AI Video Studio Billing Notice"))
     confirm_charge = st.checkbox(
@@ -1841,8 +2127,12 @@ def _render_ai_video_studio_dialog():
         type="primary",
         use_container_width=True,
     ):
-        if not str(prompt or "").strip():
-            st.error(tr("Please Enter the AI Video Prompt"))
+        has_reference_input = first_frame is not None or bool(reference_assets)
+        if not reference_upload_valid:
+            st.error(tr("Reference Upload Validation Failed"))
+            return
+        if not str(prompt or "").strip() and not has_reference_input:
+            st.error(tr("AI Video Prompt Or Reference Required"))
             return
         if selected["requires_charge_confirmation"] and not confirm_charge:
             st.error(tr("Confirm AI Video Studio Charge Required"))
@@ -1855,6 +2145,10 @@ def _render_ai_video_studio_dialog():
                     duration=int(duration),
                     video_aspect=aspect,
                     first_frame=first_frame,
+                    reference_assets=reference_assets,
+                    omni_reference_task_type=(
+                        reference_task_type if reference_assets else ""
+                    ),
                     confirm_charge=bool(confirm_charge),
                 )
         except ai_video_studio_service.AIVideoStudioError as exc:
@@ -1877,11 +2171,41 @@ def _render_ai_video_studio_dialog():
         st.success(tr("AI Video Generation Complete"))
 
     result_paths = st.session_state.get("ai_video_studio_results") or []
-    for index, path in enumerate(result_paths):
+    if result_paths:
+        result_col, clear_col = st.columns([4, 1], vertical_alignment="center")
+        with result_col:
+            st.subheader(tr("AI Video Results"))
+        with clear_col:
+            if st.button(
+                tr("Clear Results"),
+                key="ai_video_studio_clear_results",
+                use_container_width=True,
+            ):
+                st.session_state.pop("ai_video_studio_results", None)
+                st.rerun()
+    for path in result_paths:
         if not os.path.isfile(path):
             continue
-        st.video(path, key=f"ai_video_studio_result_{index}")
-        st.caption(path)
+        # st.video 不接受 key：它是无状态媒体组件，每轮重新渲染即可。
+        st.video(path)
+        st.caption(os.path.basename(path))
+        try:
+            with open(path, "rb") as handle:
+                st.download_button(
+                    tr("Download Video"),
+                    data=handle,
+                    file_name=os.path.basename(path),
+                    mime="video/mp4",
+                    key=(
+                        "ai_video_studio_download_"
+                        f"{hashlib.sha256(path.encode()).hexdigest()[:12]}"
+                    ),
+                    icon=":material/download:",
+                    on_click="ignore",
+                    use_container_width=True,
+                )
+        except OSError:
+            st.warning(tr("Generated Video File Unavailable"))
 
 
 def _render_brand(available_update: str | None = None):
@@ -2003,9 +2327,12 @@ def _render_top_bar():
                     # 写入 config.toml，后续新会话将优先使用该明确选择。
                     _set_runtime_config("ui", "language", selected_language_code)
                     _save_runtime_config()
-                    # 切换语言会先重跑顶部栏，正文控件尚未渲染就触发 rerun。
-                    # 显式保留本次创作内容，防止 Streamlit 清理旧控件状态后，
-                    # 新语言页面把已经输入的主题、文案和关键词重置为空。
+                    # 切换语言后紧接着 rerun：控件尚未在本次 run 中重新渲染，
+                    # Streamlit 会清理旧控件状态。这几句"把值写回自身"并不是
+                    # 恒等操作——它会把这些 key 标记为已被显式赋值，从而在
+                    # 下一轮 run 中保留用户已填写的主题、文案和关键词。
+                    # 删除它们会让正文内容在切换语言后被清空
+                    # （test_webui_catalan 会失败）。
                     for content_key in ("video_subject", "video_script", "video_terms"):
                         if content_key in st.session_state:
                             st.session_state[content_key] = st.session_state[content_key]
@@ -8002,12 +8329,17 @@ def _render_subtitle_settings(panel, params):
                     disabled=subtitle_settings_disabled,
                 )
                 try:
-                    params.custom_position = float(custom_position)
-                    if params.custom_position < 0 or params.custom_position > 100:
+                    parsed_position = float(custom_position)
+                    # NaN 与无穷大能通过下面的范围比较（NaN 与任何数比较都为
+                    # False），会被写进 config.toml 成为非法值。这里先拒绝。
+                    if not math.isfinite(parsed_position):
+                        st.error(tr("Please enter a valid number"))
+                    elif parsed_position < 0 or parsed_position > 100:
                         st.error(tr("Please enter a value between 0 and 100"))
                     else:
+                        params.custom_position = parsed_position
                         _set_runtime_config(
-                            "ui", "custom_position", params.custom_position
+                            "ui", "custom_position", parsed_position
                         )
                 except ValueError:
                     st.error(tr("Please enter a valid number"))
@@ -8291,19 +8623,7 @@ def _render_generation_controls(
             voxcpm_prompt_audio = _get_voxcpm_effective_prompt_audio()
             voxcpm_prompt_text = _get_voxcpm_prompt_text()
 
-        if params.video_source not in [
-            "pexels",
-            "pixabay",
-            "coverr",
-            "wavespeed",
-            "volcengine_seedance",
-            "ofox",
-            "metaso_minimax",
-            "muapi",
-            "loomloom",
-            "openai_image",
-            "local",
-        ]:
+        if params.video_source not in _ALL_VIDEO_SOURCES:
             _remove_active_generation_task(task_id)
             st.error(tr("Please Select a Valid Video Source"))
             st.stop()

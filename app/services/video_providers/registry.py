@@ -13,11 +13,15 @@
 from __future__ import annotations
 
 import importlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from types import ModuleType
 from typing import Any
 
-from app.services.video_providers.spec import FirstFrame, VideoProviderSpec
+from app.services.video_providers.spec import (
+    FirstFrame,
+    ReferenceAsset,
+    VideoProviderSpec,
+)
 
 
 # 注册顺序同时决定 WebUI 中的展示顺序。
@@ -150,11 +154,13 @@ def generate(
     minimum_duration: int,
     video_aspect: Any,
     first_frame: FirstFrame | None = None,
+    reference_assets: Sequence[ReferenceAsset] | None = None,
+    omni_reference_task_type: str = "",
 ):
     """调用 provider 的 ``generate_videos``，并统一执行能力校验。
 
-    不支持图生视频的 provider 在拿到 ``first_frame`` 时直接拒绝，避免把
-    首帧静默丢弃后仍然发起一次付费任务。
+    不支持某项能力的 provider 在拿到对应参数时直接拒绝，避免把首帧或参考
+    素材静默丢弃后仍然发起一次付费任务。
     """
     spec = get_spec(provider_id)
     if spec is None:
@@ -163,12 +169,34 @@ def generate(
         raise ValueError(
             f"{spec.provider_id} does not support image-to-video generation"
         )
+    assets = list(reference_assets or ())
+    reference_task_type = str(omni_reference_task_type or "").strip()
+    if assets and not spec.supports_reference_assets:
+        raise ValueError(
+            f"{spec.provider_id} does not support reference assets"
+        )
+    if reference_task_type and not assets:
+        raise ValueError(
+            "omni_reference_task_type requires at least one reference asset"
+        )
+    # -1 表示「由模型自动决定时长」。不支持它的源会把 -1 夹到 1 秒后照常
+    # 下单，结果是一段无用的付费视频，所以必须在注册表层拒绝。
+    if minimum_duration == -1 and not spec.supports_auto_duration:
+        raise ValueError(
+            f"{spec.provider_id} does not support automatic duration (-1)"
+        )
     module = resolve(provider_id)
+    kwargs: dict[str, Any] = {"first_frame": first_frame}
+    # 只有声明了该能力的 provider 才接收这个关键字，其余源的签名保持不变。
+    if assets:
+        kwargs["reference_assets"] = assets
+        if reference_task_type:
+            kwargs["omni_reference_task_type"] = reference_task_type
     return module.generate_videos(
         search_term,
         minimum_duration,
         video_aspect,
-        first_frame=first_frame,
+        **kwargs,
     )
 
 

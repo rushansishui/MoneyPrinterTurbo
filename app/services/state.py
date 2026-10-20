@@ -154,12 +154,44 @@ class RedisState(BaseState):
         # 这仍不是并发增删任务时的事务快照；无索引时优先保证静态任务集
         # 的分页正确性，并让 total 统计去重后的任务键。
         task_ids = self.list_task_ids(scan_count=page_size)
-        tasks = []
-        for task_id in task_ids[start:end]:
-            task = self.get_task(task_id)
-            if task is not None:
-                tasks.append(task)
-        return tasks, len(task_ids)
+        page_ids = task_ids[start:end]
+        return self._get_tasks(page_ids), len(task_ids)
+
+    def _get_tasks(self, task_ids: list[str]) -> list[dict]:
+        """批量读取一页任务，用一次 pipeline 往返代替逐 key 串行 HGETALL。
+
+        ``get_task`` 的语义（WRONGTYPE 跳过、缺失或非本应用键返回 None）
+        在这里保持一致；只是把 N 次网络往返合并成一次。
+        """
+        if not task_ids:
+            return []
+        with self._redis.pipeline(transaction=False) as pipeline:
+            for task_id in task_ids:
+                pipeline.hgetall(task_id)
+            results = pipeline.execute(raise_on_error=False)
+
+        tasks: list[dict] = []
+        for task_id, task_data in zip(task_ids, results):
+            if isinstance(task_data, ResponseError):
+                # 任务键可能在扫描后被改成其它类型（例如队列 List）。
+                if str(task_data).startswith("WRONGTYPE"):
+                    continue
+                raise task_data
+            if not task_data:
+                continue
+            if task_data.get(b"task_id") != task_id.encode("utf-8"):
+                continue
+            tasks.append(
+                {
+                    key.decode("utf-8"): (
+                        value.decode("utf-8")
+                        if key == b"task_id"
+                        else self._convert_to_original_type(value)
+                    )
+                    for key, value in task_data.items()
+                }
+            )
+        return tasks
 
     def list_task_ids(self, scan_count: int = 100) -> list[str]:
         """Return only this application's task hashes from a possibly shared DB."""

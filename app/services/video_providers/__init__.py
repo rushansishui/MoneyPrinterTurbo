@@ -22,11 +22,16 @@ from app.services.video_providers.registry import (
     is_enabled,
     resolve,
 )
-from app.services.video_providers.spec import FirstFrame, VideoProviderSpec
+from app.services.video_providers.spec import (
+    FirstFrame,
+    ReferenceAsset,
+    VideoProviderSpec,
+)
 
 
 __all__ = [
     "FirstFrame",
+    "ReferenceAsset",
     "VideoProviderDownloadError",
     "VideoProviderError",
     "VideoProviderSpec",

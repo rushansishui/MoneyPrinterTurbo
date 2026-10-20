@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from app.models.schema import MaterialInfo
 from app.services import ai_video_studio, video_providers
 from app.services.video_providers.spec import FirstFrame
+from app.services.video_providers.spec import ReferenceAsset
 
 
 @pytest.fixture
@@ -53,10 +54,12 @@ def test_providers_endpoint_lists_capabilities(client):
     # Seedance 2.5 是本期新增的能力最全的源。
     assert providers["seedance25"]["supports_image_to_video"] is True
     assert providers["seedance25"]["supports_native_audio"] is True
+    assert providers["seedance25"]["supports_reference_assets"] is True
     assert providers["seedance25"]["requires_charge_confirmation"] is True
     # 1.0 不支持 i2v / 原生音频，能力标记必须如实反映。
     assert providers["volcengine_seedance"]["supports_image_to_video"] is False
     assert providers["volcengine_seedance"]["supports_native_audio"] is False
+    assert providers["volcengine_seedance"]["supports_reference_assets"] is False
     # 未配置凭据时 enabled 为 false，前端据此提示用户先填 Key。
     assert all(item["enabled"] is False for item in providers.values())
 
@@ -251,7 +254,116 @@ def test_image_to_video_first_frame_is_passed_to_provider(client, tmp_path):
     assert frame.origin == "stock"
 
 
-def test_empty_prompt_is_rejected_by_schema(client):
+def test_reference_assets_are_passed_to_provider_and_allow_empty_prompt(client):
+    captured = {}
+
+    def fake_generate(provider_id, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    with (
+        _enable("seedance25"),
+        patch.object(
+            ai_video_studio.video_providers, "generate", side_effect=fake_generate
+        ),
+    ):
+        response = client.post(
+            "/api/v1/ai_videos",
+            json={
+                "provider": "seedance25",
+                "prompt": "",
+                "duration": 5,
+                "confirm_charge": True,
+                "omni_reference_task_type": "auto",
+                "reference_assets": [
+                    {
+                        "kind": "image",
+                        "source": "url",
+                        "value": "https://img.test/character.png",
+                    },
+                    {
+                        "kind": "video",
+                        "source": "url",
+                        "value": "https://cdn.test/movement.mp4",
+                    },
+                    {
+                        "kind": "audio",
+                        "source": "url",
+                        "value": "https://cdn.test/voice.mp3",
+                    },
+                ],
+            },
+        )
+
+    assert response.status_code == 502  # fake provider intentionally returns no clips
+    assets = captured["reference_assets"]
+    assert all(isinstance(asset, ReferenceAsset) for asset in assets)
+    assert [asset.kind for asset in assets] == ["image", "video", "audio"]
+    assert captured["omni_reference_task_type"] == "auto"
+
+
+def test_audio_reference_allows_empty_prompt(client):
+    captured = {}
+
+    def fake_generate(provider_id, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    with (
+        _enable("seedance25"),
+        patch.object(
+            ai_video_studio.video_providers, "generate", side_effect=fake_generate
+        ),
+    ):
+        response = client.post(
+            "/api/v1/ai_videos",
+            json={
+                "provider": "seedance25",
+                "prompt": "",
+                "duration": 5,
+                "confirm_charge": True,
+                "reference_assets": [
+                    {
+                        "kind": "audio",
+                        "source": "url",
+                        "value": "https://cdn.test/voice.mp3",
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 502  # fake provider intentionally returns no clips
+    assert captured["reference_assets"][0].kind == "audio"
+
+
+def test_reference_assets_are_rejected_for_unsupported_provider(client):
+    with (
+        _enable("volcengine_seedance"),
+        patch.object(ai_video_studio.video_providers, "generate") as generate,
+    ):
+        response = client.post(
+            "/api/v1/ai_videos",
+            json={
+                "provider": "volcengine_seedance",
+                "prompt": "x",
+                "duration": 5,
+                "confirm_charge": True,
+                "reference_assets": [
+                    {
+                        "kind": "image",
+                        "source": "url",
+                        "value": "https://img.test/style.png",
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 400
+    assert "reference assets" in response.json()["message"]
+    generate.assert_not_called()
+
+
+def test_empty_prompt_without_reference_is_rejected(client):
     response = client.post(
         "/api/v1/ai_videos",
         json={
@@ -261,7 +373,7 @@ def test_empty_prompt_is_rejected_by_schema(client):
             "confirm_charge": True,
         },
     )
-    # Pydantic 的 min_length 校验由全局处理器转成 400。
+    # 提示词可为空以支持「仅参考素材」；但两者都没有时服务层返回 400。
     assert response.status_code == 400
 
 

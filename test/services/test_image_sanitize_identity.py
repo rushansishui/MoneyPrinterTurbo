@@ -1,6 +1,8 @@
+import os
 import threading
 from unittest.mock import patch
 
+import pytest
 from moviepy import ImageClip, VideoFileClip
 from PIL import Image
 
@@ -57,6 +59,13 @@ def test_concurrent_same_stem_images_render_their_own_pixels(tmp_path):
         assert original.getexif()[274] == 6
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "Windows 的 MAX_PATH=260 限制让 240 字符的文件名无法创建；该用例"
+        "验证的是组件名长度上限，需要在长路径可用的平台上运行"
+    ),
+)
 def test_long_source_name_renders_without_exceeding_filesystem_name_limit(tmp_path):
     source = tmp_path / ("a" * 240 + ".jpg")
     Image.new("RGB", (64, 64), "red").convert("CMYK").save(source)
